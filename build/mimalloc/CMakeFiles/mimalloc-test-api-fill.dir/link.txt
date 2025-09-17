@@ -1,0 +1,1 @@
+/usr/local/bin/gcc -O3 -DNDEBUG "CMakeFiles/mimalloc-test-api-fill.dir/test/test-api-fill.c.o" -o mimalloc-test-api-fill  libmimalloc.a -lpthread -lrt -latomic
