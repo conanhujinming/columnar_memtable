@@ -58,7 +58,6 @@ class BloomFilter {
     void Add(std::string_view key);
     bool MayContain(std::string_view key) const;
 
-   private:
     static std::array<uint64_t, 2> Hash(std::string_view key);
     std::vector<bool> bits_;
     int num_hashes_;
@@ -514,7 +513,10 @@ class SortedColumnarBlock {
     explicit SortedColumnarBlock(std::shared_ptr<ColumnarBlock> block_to_sort, const Sorter& sorter);
     bool MayContain(std::string_view key) const;
     std::optional<RecordRef> Get(std::string_view key) const;
+    std::string_view min_key() const { return min_key_; }
+    std::string_view max_key() const { return max_key_; }
     Iterator begin() const;
+    bool empty() const { return block_data_->empty(); }
 
    private:
     friend class Iterator;
@@ -751,20 +753,82 @@ inline void ColumnarMemTable::Put(std::string_view key, std::string_view value) 
 inline void ColumnarMemTable::Delete(std::string_view key) { Insert(key, "", RecordType::Delete); }
 
 inline ColumnarMemTable::GetResult ColumnarMemTable::Get(std::string_view key) const {
+    // Step 1: Search the active block first. This is always the most recent data.
     auto current_active_block = std::atomic_load(&active_block_);
     auto result_in_active = current_active_block->Get(key);
     if (result_in_active.has_value()) {
+        // If found in the active block, we have the latest version.
+        // Return based on its type (Put or Delete).
         return (result_in_active->type == RecordType::Put) ? GetResult(result_in_active->value) : std::nullopt;
     }
-    auto sorted_blocks_snapshot = std::atomic_load(&sorted_blocks_);
-    for (auto it = sorted_blocks_snapshot->rbegin(); it != sorted_blocks_snapshot->rend(); ++it) {
-        if ((*it)->MayContain(key)) {
-            auto result_in_sorted = (*it)->Get(key);
-            if (result_in_sorted.has_value()) {
-                return (result_in_sorted->type == RecordType::Put) ? GetResult(result_in_sorted->value) : std::nullopt;
+
+    // Step 2: Access the immutable sorted blocks using a thread-local cache
+    // to eliminate contention on the shared block list.
+
+    // Grab a snapshot of the current global list of sorted blocks.
+    // This atomic load is very fast.
+    auto global_blocks_snapshot = std::atomic_load(&sorted_blocks_);
+
+    // Define the thread-local cache structures. Each thread gets its own copy.
+    // `last_seen_snapshot` tracks which version of the global list our cache corresponds to.
+    thread_local std::shared_ptr<const SortedBlockList> last_seen_snapshot = nullptr;
+    
+    // `local_meta_cache` is the actual thread-private copy of the metadata.
+    using MetaInfo = std::tuple<std::string_view, std::string_view, const SortedColumnarBlock*>;
+    thread_local std::vector<MetaInfo> local_meta_cache;
+
+    // Step 3: Check if our thread-local cache is stale. If it is, update it.
+    // This check is the only point of interaction with shared state. It compares two pointers.
+    if (last_seen_snapshot != global_blocks_snapshot) {
+        // The global list has been updated by the background thread since we last looked.
+        // We need to rebuild our private cache.
+        
+        local_meta_cache.clear();
+        if (global_blocks_snapshot) { // Ensure the global list isn't null
+            local_meta_cache.reserve(global_blocks_snapshot->size());
+            
+            // This is the copy operation. It briefly iterates over the shared global list
+            // and copies the necessary metadata (min/max keys and a raw pointer)
+            // into our private vector.
+            for (const auto& block_ptr : *global_blocks_snapshot) {
+                if (block_ptr && !block_ptr->empty()) {
+                    local_meta_cache.emplace_back(block_ptr->min_key(), block_ptr->max_key(), block_ptr.get());
+                }
+            }
+        }
+        
+        // After the copy is done, update our tracker to the new version.
+        last_seen_snapshot = global_blocks_snapshot;
+    }
+
+    // Step 4: Perform the search on the thread-local cache.
+    // This entire loop operates on `local_meta_cache`, which is private to this thread.
+    // There is ZERO cross-core cache contention here.
+    // We iterate in reverse because newer blocks are at the end of the original vector.
+    for (auto it = local_meta_cache.rbegin(); it != local_meta_cache.rend(); ++it) {
+        // Deconstruct the tuple for easy access.
+        const auto& [min_key, max_key, block_raw_ptr] = *it;
+
+        // First-level check: Use min/max keys for a quick range check.
+        // This comparison is extremely fast (likely done in CPU registers).
+        if (key < min_key || key > max_key) {
+            continue; // The key is outside this block's range, skip to the next.
+        }
+
+        // Second-level check: Use the Bloom filter. Also very fast.
+        if (block_raw_ptr->MayContain(key)) {
+            // Only if the key is in range and might be in the block,
+            // we perform the final, more expensive lookup.
+            auto result = block_raw_ptr->Get(key);
+            if (result.has_value()) {
+                // Since we are iterating from newest to oldest, the first match
+                // we find is the correct, most recent version of the record.
+                return (result->type == RecordType::Put) ? GetResult(result->value) : std::nullopt;
             }
         }
     }
+
+    // If the key was not found in the active block or any of the sorted blocks.
     return std::nullopt;
 }
 

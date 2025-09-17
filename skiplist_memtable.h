@@ -6,21 +6,72 @@
 
 #include "columnar_memtable.h"  // Includes FlushIterator and CompactingIterator definitions
 
-class SimpleArena {
+#include <atomic>
+#include <vector>
+#include <memory>
+#include <algorithm> // for std::max
+
+// A thread-safe, lock-free arena for concurrent allocations.
+class ConcurrentArena {
 public:
-    SimpleArena() : current_block_idx_(-1) {}
+    ConcurrentArena() : current_block_(AllocateNewBlock(4096)) {}
+
+    ~ConcurrentArena() {
+        // The linked-list of blocks will be cleaned up automatically by unique_ptr.
+        // We just need to delete the head of the list.
+        Block* block = current_block_.load(std::memory_order_relaxed);
+        while (block != nullptr) {
+            Block* next = block->next.load(std::memory_order_relaxed);
+            delete block;
+            block = next;
+        }
+    }
+
+    // No copying or moving.
+    ConcurrentArena(const ConcurrentArena&) = delete;
+    ConcurrentArena& operator=(const ConcurrentArena&) = delete;
 
     char* AllocateRaw(size_t bytes) {
-        std::lock_guard<std::mutex> lock(mutex_); // Lock for thread safety
-        if (current_block_idx_ < 0 || blocks_[current_block_idx_].pos + bytes > blocks_[current_block_idx_].size) {
-            size_t block_size = std::max(bytes, static_cast<size_t>(4096));
-            blocks_.emplace_back(block_size);
-            current_block_idx_++;
+        // Add padding for alignment. A common practice.
+        const size_t align = alignof(std::max_align_t);
+        bytes = (bytes + align - 1) & ~(align - 1);
+
+        while (true) {
+            Block* current = current_block_.load(std::memory_order_acquire);
+            size_t old_pos = current->pos.fetch_add(bytes, std::memory_order_relaxed);
+
+            if (old_pos + bytes <= current->size) {
+                // Success! We found space in the current block.
+                return current->data.get() + old_pos;
+            } else {
+                // The current block is full. We need to allocate a new one.
+                // It's possible multiple threads notice this at the same time.
+                // Only one will succeed in replacing the current_block_.
+                
+                // Roll back the fetch_add, though this is not strictly necessary
+                // as the wasted space is at the end of a full block.
+                // current->pos.fetch_sub(bytes, std::memory_order_relaxed);
+
+                size_t new_block_size = std::max(bytes, static_cast<size_t>(4096));
+                Block* new_block = AllocateNewBlock(new_block_size);
+                
+                // Try to swap the current block with our new one.
+                // If another thread already swapped it, `current` will be stale,
+                // and the CAS will fail. In that case, we just loop again
+                // and try to allocate from the new block installed by the other thread.
+                if (current_block_.compare_exchange_strong(current, new_block, 
+                                                           std::memory_order_release,
+                                                           std::memory_order_acquire)) {
+                    // We successfully installed the new block.
+                    // Link the old block to the new one for eventual cleanup.
+                    new_block->next.store(current, std::memory_order_relaxed);
+                } else {
+                    // Another thread won the race. Delete the block we allocated but didn't use.
+                    delete new_block;
+                }
+                // In either case (CAS success or failure), we retry the allocation in the next loop iteration.
+            }
         }
-        Block& current_block = blocks_[current_block_idx_];
-        char* result = current_block.data.get() + current_block.pos;
-        current_block.pos += bytes;
-        return result;
     }
 
     std::string_view AllocateAndCopy(std::string_view data) {
@@ -28,16 +79,26 @@ public:
         memcpy(mem, data.data(), data.size());
         return {mem, data.size()};
     }
+
 private:
     struct Block {
         std::unique_ptr<char[]> data;
-        size_t pos;
-        size_t size;
-        explicit Block(size_t s) : data(new char[s]), pos(0), size(s) {}
+        const size_t size;
+        std::atomic<size_t> pos;
+        // Blocks are stored as a singly-linked list for cleanup.
+        std::atomic<Block*> next; 
+
+        explicit Block(size_t s) : data(new char[s]), size(s), pos(0), next(nullptr) {}
     };
-    std::vector<Block> blocks_;
-    int current_block_idx_;
-    std::mutex mutex_; // The crucial mutex for thread safety
+
+    // Helper to create a new block.
+    static Block* AllocateNewBlock(size_t s) {
+        return new Block(s);
+    }
+    
+    // The head of the block list, where allocations happen.
+    // This is the main point of contention, handled by atomics.
+    std::atomic<Block*> current_block_;
 };
 
 namespace SkipListImpl {
@@ -52,7 +113,7 @@ class ConcurrentSkipList {
         std::atomic<Node*> forward[1];
 
         // Factory function to correctly allocate a node of a specific height.
-        static Node* New(SimpleArena& arena, std::string_view key, std::string_view value, RecordType type,
+        static Node* New(ConcurrentArena& arena, std::string_view key, std::string_view value, RecordType type,
                          int height) {
             // Calculate size needed for the node header and the flexible array member.
             size_t size = sizeof(Node) + sizeof(std::atomic<Node*>) * (height - 1);
@@ -80,7 +141,7 @@ class ConcurrentSkipList {
    private:
     int RandomHeight();
 
-    SimpleArena arena_;
+    ConcurrentArena arena_;
     Node* const head_;
     std::atomic<int> max_height_;
 };
