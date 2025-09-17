@@ -1,38 +1,37 @@
 // This must be the first include to ensure it overrides the default allocator
 #include <mimalloc.h>
 
-#include <iostream>
-#include <vector>
-#include <string>
-#include <random>
-#include <chrono>
-#include <thread>
+// --- Standard Library Includes ---
+#include <algorithm>
+#include <atomic>
 #include <functional>
 #include <iomanip>
+#include <iostream>
+#include <memory>
 #include <numeric>
-#include <atomic>
-#include <algorithm> // for std::find_if
+#include <random>
+#include <string>
+#include <thread>
+#include <vector>
 
-#include "columnar_memtable.h" // Use the final correct version
+// --- Third-Party Includes ---
+#include "benchmark/benchmark.h"
+
+// --- Project Includes ---
+#include "columnar_memtable.h"
+#include "skiplist_memtable.h"
 
 // =================================================================================================
 // UTILITIES
 // =================================================================================================
 
-// High-precision timer
-inline std::chrono::nanoseconds now_nanos() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now().time_since_epoch());
-}
-
-// Generate a random string of a given length
+// Generates a random alphanumeric string of a given length.
 std::string generate_random_string(size_t length) {
-    const char charset[] =
-        "0123456789"
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz";
+    const char charset[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     const size_t max_index = (sizeof(charset) - 1);
     thread_local std::mt19937 generator(std::random_device{}());
     std::uniform_int_distribution<size_t> distribution(0, max_index - 1);
+
     std::string random_string(length, '\0');
     for (size_t i = 0; i < length; ++i) {
         random_string[i] = charset[distribution(generator)];
@@ -41,261 +40,372 @@ std::string generate_random_string(size_t length) {
 }
 
 // =================================================================================================
-// FUNCTIONAL TESTING FRAMEWORK
+// GENERIC FUNCTIONAL TESTING FRAMEWORK (Using Templates)
 // =================================================================================================
-
 namespace FunctionalTests {
 
-int tests_passed = 0;
-int tests_failed = 0;
+int total_tests_passed = 0;
+int total_tests_failed = 0;
 
 void RUN_TEST(const std::function<bool()>& test_func, const std::string& test_name) {
     std::cout << "[RUNNING] " << test_name << "..." << std::flush;
-    bool success = test_func();
-    if (success) {
-        tests_passed++;
+    if (test_func()) {
+        total_tests_passed++;
         std::cout << "\r[  PASS ] " << test_name << std::endl;
     } else {
-        tests_failed++;
+        total_tests_failed++;
         std::cout << "\r[  FAIL ] " << test_name << std::endl;
     }
 }
 
+template <typename MemTableType>
 bool TestBasicPutGetDelete() {
-    ColumnarMemTable memtable;
+    MemTableType memtable(1024, false);
     memtable.Put("apple", "red");
     memtable.Put("banana", "yellow");
+
     auto val = memtable.Get("apple");
-    if (!val.has_value() || val.value() != "red") return false;
+    if (!val.has_value() || val.value() != "red") {
+        return false;
+    }
+
     memtable.Delete("banana");
     val = memtable.Get("banana");
-    return !val.has_value();
+    if (val.has_value()) {
+        return false;
+    }
+
+    memtable.WaitForBackgroundWork();
+    return true;
 }
 
+template <typename MemTableType>
 bool TestOverwrite() {
-    ColumnarMemTable memtable;
+    MemTableType memtable(1024, false);
     memtable.Put("key1", "value1");
     memtable.Put("key1", "value2");
     auto val = memtable.Get("key1");
+    memtable.WaitForBackgroundWork();
     return val.has_value() && val.value() == "value2";
 }
 
-bool TestBackgroundSortCorrectness() {
-    ColumnarMemTable memtable(512, false); // Small threshold, no compaction
-    memtable.Put("apple", "red");
-    memtable.Put("banana", "yellow");
-    memtable.Put("apple", "green"); // Overwrite
-    memtable.Put("orange", "orange");
-    memtable.Put("grape", "purple"); // This will trigger sort
-    memtable.WaitForBackgroundWork();
-    
-    memtable.Put("mango", "yellow"); // Goes into new unsorted block
-    
-    auto apple = memtable.Get("apple");
-    return apple.has_value() && apple.value() == "green";
-}
-
-// ** MODIFIED TEST for CompactingIterator **
-// This test now verifies the correctness of the high-level CompactingIterator.
+template <typename MemTableType>
 bool TestCompactingIteratorCorrectness() {
-    ColumnarMemTable memtable(512, false); // Small threshold
+    MemTableType memtable(512, false);
     memtable.Put("c", "3");
     memtable.Put("a", "1");
     memtable.Put("e", "5");
     memtable.Put("b", "2");
-
-    memtable.Put("d", "4"); // Trigger sort
+    memtable.Put("d", "4");  // Trigger internal state change if applicable
     memtable.WaitForBackgroundWork();
-    
-    memtable.Put("c", "3_new"); // Overwrite in unsorted
-    memtable.Delete("a"); // Delete in unsorted
 
-    // Use the new, high-level iterator that handles de-duplication.
+    memtable.Put("c", "3_new");  // Overwrite in the new active block
+    memtable.Delete("a");        // Delete in the new active block
+
     auto iter = memtable.NewCompactingIterator();
-    
     std::vector<std::pair<std::string, std::string>> results;
-    while(iter->IsValid()) {
+    while (iter->IsValid()) {
         RecordRef rec = iter->Get();
         results.emplace_back(std::string(rec.key), std::string(rec.value));
         iter->Next();
     }
 
     std::vector<std::pair<std::string, std::string>> expected_results = {
-        {"b", "2"}, {"c", "3_new"}, {"d", "4"}, {"e", "5"}
-    };
-    
+        {"b", "2"}, {"c", "3_new"}, {"d", "4"}, {"e", "5"}};
+
     if (results != expected_results) {
-        // Optional: Print for debugging
-        std::cout << "\n[DEBUG] Mismatch in CompactingIterator output.\n";
-        std::cout << "[DEBUG]   Expected: ";
-        for(const auto& p : expected_results) std::cout << "{" << p.first << ":" << p.second << "} ";
-        std::cout << "\n[DEBUG]   Actual:   ";
-        for(const auto& p : results) std::cout << "{" << p.first << ":" << p.second << "} ";
-        std::cout << std::endl;
+        std::cerr << "\n  [DEBUG] Iterator Mismatch!\n"
+                  << "  Expected: {b:2}, {c:3_new}, {d:4}, {e:5}\n"
+                  << "  Actual:   ";
+        for (const auto& p : results) std::cerr << "{" << p.first << ":" << p.second << "} ";
+        std::cerr << std::endl;
         return false;
     }
-
     return true;
 }
 
-void RunAll() {
-    std::cout << "--- Running Functional Tests ---" << std::endl;
-    RUN_TEST(TestBasicPutGetDelete, "Basic Put, Get, Delete");
-    RUN_TEST(TestOverwrite, "Key Overwrite");
-    RUN_TEST(TestBackgroundSortCorrectness, "Background Sort Correctness");
-    RUN_TEST(TestCompactingIteratorCorrectness, "Compacting Iterator Correctness");
-
-    std::cout << "\n--- Test Summary ---" << std::endl;
-    std::cout << "PASSED: " << tests_passed << ", FAILED: " << tests_failed << std::endl;
-    if (tests_failed > 0) {
-        std::cerr << "!!! SOME FUNCTIONAL TESTS FAILED !!!" << std::endl;
-    }
+template <typename MemTableType>
+void RunAllFor(const std::string& type_name) {
+    std::cout << "\n--- Running Functional Tests for " << type_name << " ---" << std::endl;
+    RUN_TEST(TestBasicPutGetDelete<MemTableType>, "Basic Put, Get, Delete");
+    RUN_TEST(TestOverwrite<MemTableType>, "Key Overwrite");
+    RUN_TEST(TestCompactingIteratorCorrectness<MemTableType>, "Compacting Iterator Correctness");
 }
 
-} // namespace FunctionalTests
-
+}  // namespace FunctionalTests
 
 // =================================================================================================
-// PERFORMANCE TESTING FRAMEWORK
+// GOOGLE BENCHMARK PERFORMANCE TESTS
 // =================================================================================================
-namespace PerformanceTests {
+const int NUM_OPS = 500'000;
+const size_t KEY_LEN = 16;
+const size_t VAL_LEN = 100;
+const size_t BLOCK_SIZE_BYTES = 16 * 1024 * 32;
+const unsigned int NUM_THREADS = std::thread::hardware_concurrency();
 
-struct BenchmarkResult { long long operations; std::chrono::nanoseconds duration; };
-class Benchmark {
-public:
-    Benchmark(std::string name, std::function<BenchmarkResult()> func) : name_(std::move(name)), func_(std::move(func)) {}
-    void Run() { std::cout << "[RUNNING] " << name_ << "..." << std::flush; result_ = func_(); std::cout << "\r"; }
-    void Report() const {
-        double seconds = result_.duration.count() / 1e9;
-        double ops_per_sec = result_.operations / seconds;
-        std::cout << std::left << std::setw(25) << name_ << ": "
-                  << std::right << std::setw(12) << std::fixed << std::setprecision(0) << ops_per_sec
-                  << " ops/sec (" << result_.operations << " ops in "
-                  << std::fixed << std::setprecision(3) << seconds << " s)" << std::endl;
+using StringPair = std::pair<std::string, std::string>;
+std::vector<StringPair> write_data;
+std::vector<std::string> read_keys;
+// Removed the manual barrier, as it conflicts with google-benchmark's internal scheduler.
+
+void PrepareData(int num_ops) {
+    std::cout << "--- Preparing " << num_ops << " key/value pairs for benchmarks ---" << std::endl;
+    write_data.reserve(num_ops); read_keys.reserve(num_ops);
+    for (int i = 0; i < num_ops; ++i) {
+        std::string key = generate_random_string(KEY_LEN);
+        write_data.push_back({key, generate_random_string(VAL_LEN)});
+        read_keys.push_back(key);
     }
-private:
-    std::string name_; std::function<BenchmarkResult()> func_; BenchmarkResult result_;
+    std::shuffle(read_keys.begin(), read_keys.end(), std::mt19937(std::random_device{}()));
+}
+
+template <typename MemTableType>
+class BenchmarkRunner {
+public:
+    std::unique_ptr<MemTableType> memtable;
+    void SetUp(const benchmark::State& state) {
+        // No longer need to reset the ready_threads counter.
+        bool compaction = state.range(0);
+        size_t memtable_size = state.threads() > 1 ? (BLOCK_SIZE_BYTES * 4) : BLOCK_SIZE_BYTES;
+        memtable = std::make_unique<MemTableType>(memtable_size, compaction);
+    }
+    void TearDown([[maybe_unused]]const benchmark::State& state) {
+        if (memtable) memtable->WaitForBackgroundWork();
+        memtable.reset();
+    }
 };
 
-const int NUM_OPS = 1'000'000;
+// =================================================================================================
+// BENCHMARK IMPLEMENTATION FUNCTIONS
+// =================================================================================================
 
-// Benchmarks now accept a factory function to create configured memtables
-using MemTableFactory = std::function<std::unique_ptr<ColumnarMemTable>()>;
-
-BenchmarkResult BenchWriteRandom(int num_ops, const MemTableFactory& factory) {
-    auto memtable = factory();
-    std::vector<std::string> keys(num_ops);
-    for (int i = 0; i < num_ops; ++i) { keys[i] = generate_random_string(16); }
-    auto start = now_nanos();
-    for (int i = 0; i < num_ops; ++i) { memtable->Put(keys[i], "v"); }
-    memtable->WaitForBackgroundWork(); // Wait for bg thread to finish to get a full time
-    auto end = now_nanos();
-    return {num_ops, end - start};
-}
-
-BenchmarkResult BenchReadRandom(int num_ops, const MemTableFactory& factory) {
-    auto memtable = factory();
-    std::vector<std::string> keys(num_ops);
-    for (int i = 0; i < num_ops; ++i) {
-        keys[i] = generate_random_string(16);
-        memtable->Put(keys[i], "value");
-    }
-    memtable->WaitForBackgroundWork();
-    
-    std::cout << "block num after put " << memtable->GetSortedBlockNum() << std::endl;
-    std::shuffle(keys.begin(), keys.end(), std::mt19937(std::random_device{}()));
-    auto start = now_nanos();
-    for (int i = 0; i < num_ops; ++i) { (void)memtable->Get(keys[i]); }
-    auto end = now_nanos();
-    return {num_ops, end - start};
-}
-
-BenchmarkResult BenchReadWriteMixed(int num_ops, int num_threads, int read_percent, const MemTableFactory& factory) {
-    auto memtable = factory();
-    std::atomic<bool> done = false;
-    int read_threads = std::max(1, static_cast<int>(num_threads * (read_percent / 100.0)));
-    int write_threads = std::max(1, num_threads - read_threads);
-    int write_ops_per_thread = num_ops / write_threads;
-    std::atomic<long long> read_ops = 0;
-    
-    // Pre-populate with some data
-    for (int i = 0; i < 10000; ++i) { memtable->Put(generate_random_string(16), "v"); }
-    memtable->WaitForBackgroundWork();
-
-    std::vector<std::thread> threads;
-    auto start = now_nanos();
-    for (int t = 0; t < write_threads; ++t) {
-        threads.emplace_back([&, write_ops_per_thread]() {
-            for (int i = 0; i < write_ops_per_thread; ++i) { memtable->Put(generate_random_string(16), "v"); }
-        });
-    }
-    for (int t = 0; t < read_threads; ++t) {
-        threads.emplace_back([&]() {
-            long long local_read_ops = 0;
-            while (!done.load(std::memory_order_acquire)) {
-                (void)memtable->Get(generate_random_string(16));
-                local_read_ops++;
-            }
-            read_ops.fetch_add(local_read_ops);
-        });
-    }
-    for (int t = 0; t < write_threads; ++t) { threads[t].join(); }
-    done.store(true, std::memory_order_release);
-    for (size_t t = write_threads; t < threads.size(); ++t) { threads[t].join(); }
-    auto end = now_nanos();
-    return {num_ops + read_ops.load(), end - start};
-}
-
-
-void RunAll() {
-    std::cout << "\n--- Running Performance Tests (1M ops each) ---" << std::endl;
-    std::cout << "NOTE: Compile with -O3 or Release mode for accurate results." << std::endl;
-    const unsigned int thread_count = std::thread::hardware_concurrency();
-    std::cout << "Using " << thread_count << " threads for concurrent benchmarks." << std::endl;
-
-    const size_t BLOCK_SIZE_BYTES = 16 * 1024 * 32;
-
-    for (bool compaction_enabled : {false, true}) {
-        std::cout << "\n--- Testing with Compaction " << (compaction_enabled ? "ENABLED" : "DISABLED") 
-                  << " (Block Size: " << BLOCK_SIZE_BYTES / 1024 << "KB) ---" << std::endl;
-
-        auto factory = [=]() {
-            return std::make_unique<ColumnarMemTable>(BLOCK_SIZE_BYTES, compaction_enabled);
-        };
-        
-        std::vector<Benchmark> benchmarks = {
-            Benchmark("Write Random",     [&](){ return BenchWriteRandom(NUM_OPS, factory); }),
-            Benchmark("Read Random",      [&](){ return BenchReadRandom(NUM_OPS, factory); }),
-            Benchmark("80/20 Read/Write", [&](){ return BenchReadWriteMixed(NUM_OPS/10, thread_count, 80, factory); })
-        };
-        
-        for (auto& bench : benchmarks) {
-            bench.Run();
-            bench.Report();
+template <typename MemTableType>
+void BM_ScalarWrite(benchmark::State& state) {
+    BenchmarkRunner<MemTableType> runner;
+    runner.SetUp(state);
+    for (auto _ : state) {
+        for (const auto& pair : write_data) {
+            runner.memtable->Put(pair.first, pair.second);
         }
     }
+    runner.TearDown(state);
+    state.SetItemsProcessed(state.iterations() * write_data.size());
 }
 
-} // namespace PerformanceTests
+template <typename MemTableType>
+void BM_ScalarRead(benchmark::State& state) {
+    BenchmarkRunner<MemTableType> runner;
+    runner.SetUp(state);
+    for (const auto& pair : write_data) runner.memtable->Put(pair.first, pair.second);
+    runner.memtable->WaitForBackgroundWork();
+    for (auto _ : state) {
+        for (const auto& key : read_keys) {
+            auto val = runner.memtable->Get(key);
+            benchmark::DoNotOptimize(val);
+        }
+    }
+    runner.TearDown(state);
+    state.SetItemsProcessed(state.iterations() * read_keys.size());
+}
+
+template <typename MemTableType>
+void BM_BatchWrite(benchmark::State& state) {
+    BenchmarkRunner<MemTableType> runner;
+    runner.SetUp(state);
+    std::vector<std::pair<std::string_view, std::string_view>> batch_view;
+    batch_view.reserve(write_data.size());
+    for (const auto& pair : write_data) batch_view.emplace_back(pair.first, pair.second);
+    for (auto _ : state) {
+        runner.memtable->PutBatch(batch_view);
+    }
+    runner.TearDown(state);
+    state.SetItemsProcessed(state.iterations() * write_data.size());
+}
+
+template <typename MemTableType>
+void BM_BatchRead(benchmark::State& state) {
+    BenchmarkRunner<MemTableType> runner;
+    runner.SetUp(state);
+    for (const auto& pair : write_data) runner.memtable->Put(pair.first, pair.second);
+    runner.memtable->WaitForBackgroundWork();
+    std::vector<std::string_view> keys_view;
+    keys_view.reserve(read_keys.size());
+    for (const auto& key : read_keys) keys_view.emplace_back(key);
+    for (auto _ : state) {
+        auto result = runner.memtable->MultiGet(keys_view);
+        benchmark::DoNotOptimize(result);
+    }
+    runner.TearDown(state);
+    state.SetItemsProcessed(state.iterations() * read_keys.size());
+}
+
+template <typename MemTableType>
+void BM_ConcurrentWrite(benchmark::State& state) {
+    static BenchmarkRunner<MemTableType> runner;
+    if (state.thread_index() == 0) runner.SetUp(state);
+    
+    size_t items_per_thread = write_data.size() / state.threads();
+    size_t start = state.thread_index() * items_per_thread;
+    size_t end = (state.thread_index() == state.threads() - 1) ? write_data.size() : start + items_per_thread;
+    
+    // Manual barrier removed. google-benchmark handles thread synchronization.
+    
+    for (auto _ : state) {
+        for (size_t i = start; i < end; ++i) runner.memtable->Put(write_data[i].first, write_data[i].second);
+    }
+
+    if (state.thread_index() == 0) runner.TearDown(state);
+    state.SetItemsProcessed(state.iterations() * (end - start));
+}
+
+template <typename MemTableType>
+void BM_ConcurrentRead(benchmark::State& state) {
+    static BenchmarkRunner<MemTableType> runner;
+    if (state.thread_index() == 0) {
+        runner.SetUp(state);
+        for (const auto& pair : write_data) runner.memtable->Put(pair.first, pair.second);
+        runner.memtable->WaitForBackgroundWork();
+    }
+
+    size_t items_per_thread = read_keys.size() / state.threads();
+    size_t start = state.thread_index() * items_per_thread;
+    size_t end = (state.thread_index() == state.threads() - 1) ? read_keys.size() : start + items_per_thread;
+
+    // Manual barrier removed.
+
+    for (auto _ : state) {
+        for (size_t i = start; i < end; ++i) {
+            auto val = runner.memtable->Get(read_keys[i]);
+            benchmark::DoNotOptimize(val);
+        }
+    }
+    
+    if (state.thread_index() == 0) runner.TearDown(state);
+    state.SetItemsProcessed(state.iterations() * (end - start));
+}
+
+template <typename MemTableType>
+void BM_ConcurrentMixed(benchmark::State& state) {
+    static BenchmarkRunner<MemTableType> runner;
+    int read_percent = state.range(1);
+
+    if (state.thread_index() == 0) {
+        runner.SetUp(state);
+        for (size_t i = write_data.size() / 2; i < write_data.size(); ++i) runner.memtable->Put(write_data[i].first, write_data[i].second);
+        runner.memtable->WaitForBackgroundWork();
+    }
+    
+    unsigned int write_threads = std::max(1u, (unsigned int)state.threads() * (100 - read_percent) / 100);
+    
+    // Manual barrier removed.
+    
+    size_t items_processed = 0;
+    for (auto _ : state) {
+        if (static_cast<unsigned int>(state.thread_index()) < write_threads) {
+            size_t write_ops_total = write_data.size() / 2;
+            size_t items_per_thread = write_ops_total / write_threads;
+            size_t start = state.thread_index() * items_per_thread;
+            size_t end = (static_cast<unsigned int>(state.thread_index()) == write_threads - 1) ? write_ops_total : start + items_per_thread;
+            for (size_t i = start; i < end; ++i) runner.memtable->Put(write_data[i].first, write_data[i].second);
+            items_processed = end - start;
+        } else {
+            size_t read_threads_count = state.threads() - write_threads;
+            if (read_threads_count > 0) {
+                size_t thread_read_idx = state.thread_index() - write_threads;
+                size_t items_per_thread = read_keys.size() / read_threads_count;
+                size_t start = thread_read_idx * items_per_thread;
+                size_t end = (thread_read_idx == read_threads_count - 1) ? read_keys.size() : start + items_per_thread;
+                for (size_t i = start; i < end; ++i) {
+                    auto val = runner.memtable->Get(read_keys[i]);
+                    benchmark::DoNotOptimize(val);
+                }
+                items_processed = end - start;
+            }
+        }
+    }
+
+    if (state.thread_index() == 0) runner.TearDown(state);
+    state.SetItemsProcessed(state.iterations() * items_processed);
+}
+
+// =================================================================================================
+// BENCHMARK REGISTRATION
+// =================================================================================================
+
+template<typename MemTableType>
+void RegisterBenchmarksForType(const std::string& type_name) {
+    static std::vector<std::string> benchmark_names;
+
+    for (int compaction_arg : {0, 1}) {
+        if (type_name == "SkipListMemTable" && compaction_arg == 1) {
+            continue;
+        }
+
+        std::string compaction_name = (compaction_arg == 0) ? "NoCompaction" : "Compaction";
+
+        benchmark_names.push_back("BM_ScalarWrite<" + type_name + ">/" + compaction_name);
+        benchmark::RegisterBenchmark(benchmark_names.back().c_str(), &BM_ScalarWrite<MemTableType>)->Arg(compaction_arg);
+
+        benchmark_names.push_back("BM_ScalarRead<" + type_name + ">/" + compaction_name);
+        benchmark::RegisterBenchmark(benchmark_names.back().c_str(), &BM_ScalarRead<MemTableType>)->Arg(compaction_arg);
+
+        benchmark_names.push_back("BM_BatchWrite<" + type_name + ">/" + compaction_name);
+        benchmark::RegisterBenchmark(benchmark_names.back().c_str(), &BM_BatchWrite<MemTableType>)->Arg(compaction_arg);
+
+        benchmark_names.push_back("BM_BatchRead<" + type_name + ">/" + compaction_name);
+        benchmark::RegisterBenchmark(benchmark_names.back().c_str(), &BM_BatchRead<MemTableType>)->Arg(compaction_arg);
+
+        benchmark_names.push_back("BM_ConcurrentWrite<" + type_name + ">/" + compaction_name);
+        benchmark::RegisterBenchmark(benchmark_names.back().c_str(), &BM_ConcurrentWrite<MemTableType>)->Arg(compaction_arg)->Threads(NUM_THREADS)->UseRealTime();
+
+        benchmark_names.push_back("BM_ConcurrentRead<" + type_name + ">/" + compaction_name);
+        benchmark::RegisterBenchmark(benchmark_names.back().c_str(), &BM_ConcurrentRead<MemTableType>)->Arg(compaction_arg)->Threads(NUM_THREADS)->UseRealTime();
+        
+        benchmark_names.push_back("BM_ConcurrentMixed<" + type_name + ">/" + compaction_name + "_80R20W");
+        benchmark::RegisterBenchmark(benchmark_names.back().c_str(), &BM_ConcurrentMixed<MemTableType>)->Args({compaction_arg, 80})->Threads(NUM_THREADS)->UseRealTime();
+    }
+}
 
 // =================================================================================================
 // MAIN
 // =================================================================================================
+int main(int argc, char** argv) {
+    std::cout << "MemTable Implementation Test and Benchmark Suite\n" << "Allocator: mimalloc" << std::endl;
 
-int main() {
-    std::cout << "ColumnarMemTable Test and Benchmark Suite" << std::endl;
-    std::cout << "Allocator: mimalloc" << std::endl;
+    FunctionalTests::RunAllFor<ColumnarMemTable>("ColumnarMemTable");
+    FunctionalTests::RunAllFor<SkipListMemTable>("SkipListMemTable");
 
-    FunctionalTests::RunAll();
-    
-    if (FunctionalTests::tests_failed == 0) {
-        PerformanceTests::RunAll();
-    } else {
-        std::cerr << "\nSkipping performance tests due to functional test failures." << std::endl;
+    std::cout << "\n--- Functional Test Summary ---\n" << "TOTAL PASSED: " << FunctionalTests::total_tests_passed << ", TOTAL FAILED: " << FunctionalTests::total_tests_failed << std::endl;
+    if (FunctionalTests::total_tests_failed > 0) {
+        std::cerr << "\n!!! SKIPPING PERFORMANCE TESTS due to functional test failures. !!!" << std::endl;
+        return 1;
     }
 
+    PrepareData(NUM_OPS);
+    
+    RegisterBenchmarksForType<ColumnarMemTable>("ColumnarMemTable");
+    RegisterBenchmarksForType<SkipListMemTable>("SkipListMemTable");
+
+    std::cout << "\n--- Running Performance Benchmarks ---" << std::endl;
+    ::benchmark::Initialize(&argc, argv);
+    if (::benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
+    
+    ::benchmark::RunSpecifiedBenchmarks();
+
+    // The correct and safe shutdown order.
+    // 1. Shutdown the benchmark library first, letting it clean up its internal resources.
+    ::benchmark::Shutdown();
+
+    // 2. Now, clean up our own global data. This avoids conflicts.
+    std::cout << "\n--- Releasing benchmark data ---" << std::endl;
+    write_data.clear();
+    write_data.shrink_to_fit();
+    read_keys.clear();
+    read_keys.shrink_to_fit();
+
+    // 3. Finally, print the allocator stats before exiting.
     std::cout << "\n--- mimalloc Final Stats ---" << std::endl;
     mi_stats_print(nullptr);
     
-    return FunctionalTests::tests_failed > 0 ? 1 : 0;
+    return 0;
 }
