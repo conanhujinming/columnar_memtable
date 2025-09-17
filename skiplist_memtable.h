@@ -6,6 +6,40 @@
 
 #include "columnar_memtable.h"  // Includes FlushIterator and CompactingIterator definitions
 
+class SimpleArena {
+public:
+    SimpleArena() : current_block_idx_(-1) {}
+
+    char* AllocateRaw(size_t bytes) {
+        std::lock_guard<std::mutex> lock(mutex_); // Lock for thread safety
+        if (current_block_idx_ < 0 || blocks_[current_block_idx_].pos + bytes > blocks_[current_block_idx_].size) {
+            size_t block_size = std::max(bytes, static_cast<size_t>(4096));
+            blocks_.emplace_back(block_size);
+            current_block_idx_++;
+        }
+        Block& current_block = blocks_[current_block_idx_];
+        char* result = current_block.data.get() + current_block.pos;
+        current_block.pos += bytes;
+        return result;
+    }
+
+    std::string_view AllocateAndCopy(std::string_view data) {
+        char* mem = AllocateRaw(data.size());
+        memcpy(mem, data.data(), data.size());
+        return {mem, data.size()};
+    }
+private:
+    struct Block {
+        std::unique_ptr<char[]> data;
+        size_t pos;
+        size_t size;
+        explicit Block(size_t s) : data(new char[s]), pos(0), size(s) {}
+    };
+    std::vector<Block> blocks_;
+    int current_block_idx_;
+    std::mutex mutex_; // The crucial mutex for thread safety
+};
+
 namespace SkipListImpl {
 
 class ConcurrentSkipList {
