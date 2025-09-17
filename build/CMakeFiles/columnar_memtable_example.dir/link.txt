@@ -1,1 +1,0 @@
-/usr/local/bin/c++ -O3 -DNDEBUG CMakeFiles/columnar_memtable_example.dir/main.cpp.o -o columnar_memtable_example  mimalloc/libmimalloc.a -lpthread -lrt -latomic -lpthread
