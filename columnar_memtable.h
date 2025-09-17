@@ -188,8 +188,10 @@ struct StoredRecord {
     RecordRef record;
 };
 
+class ColumnarMemTable; 
 class ColumnarRecordArena {
    private:
+    friend class ColumnarMemTable; 
     friend class Iterator;
     struct DataChunk {
         static constexpr size_t kRecordCapacity = 256;
@@ -405,6 +407,7 @@ inline const StoredRecord* ConcurrentStringHashMap::Find(std::string_view key) c
     return nullptr;
 }
 class FlashActiveBlock {
+    friend class ColumnarMemTable;
    public:
     explicit FlashActiveBlock(size_t cap) : index_(cap) {}
     ~FlashActiveBlock() {}
@@ -686,12 +689,14 @@ class ColumnarMemTable {
    private:
     struct ImmutableState {
         using SortedBlockList = std::vector<std::shared_ptr<const SortedColumnarBlock>>;
-        using MetaInfo = std::tuple<std::string_view, std::string_view, const SortedColumnarBlock*>;
+        
+        using MetaInfo = std::tuple<std::string_view, std::string_view, std::shared_ptr<const SortedColumnarBlock>>;
+        
         std::shared_ptr<const SortedBlockList> blocks;
         std::shared_ptr<const std::vector<MetaInfo>> read_meta_cache;
         ImmutableState()
             : blocks(std::make_shared<const SortedBlockList>()),
-              read_meta_cache(std::make_shared<const std::vector<MetaInfo>>()) {}
+            read_meta_cache(std::make_shared<const std::vector<MetaInfo>>()) {}
     };
     std::unique_ptr<FlushIterator> NewRawFlushIterator();
     void Insert(std::string_view key, std::string_view value, RecordType type);
@@ -731,18 +736,16 @@ inline ColumnarMemTable::~ColumnarMemTable() {
 }
 
 inline FlashActiveBlock* ColumnarMemTable::GetActiveBlockForThread(bool force_refresh) const {
-    // 缓存现在与 memtable 实例的地址关联
     thread_local const ColumnarMemTable* last_memtable_instance = nullptr;
     thread_local FlashActiveBlock* active_block_cache = nullptr;
     thread_local uint64_t last_seen_seal_sequence = -1;
 
     uint64_t current_sequence = seal_sequence_.load(std::memory_order_acquire);
 
-    // 如果 memtable 实例变了，或者 seal 序列变了，就强制刷新缓存
     if (force_refresh || last_memtable_instance != this || last_seen_seal_sequence != current_sequence) {
         active_block_cache = std::atomic_load(&active_block_).get();
         last_seen_seal_sequence = current_sequence;
-        last_memtable_instance = this;  // 记录当前的 memtable 实例
+        last_memtable_instance = this;
     }
 
     return active_block_cache;
@@ -774,7 +777,7 @@ inline ColumnarMemTable::GetResult ColumnarMemTable::Get(std::string_view key) c
     }
     if (cache) {
         for (auto it = cache->rbegin(); it != cache->rend(); ++it) {
-            const auto& [min_k, max_k, ptr] = *it;
+            const auto& [min_k, max_k, ptr] = *it; 
             if (key >= min_k && key <= max_k) {
                 if (ptr->MayContain(key)) {
                     if (auto r = ptr->Get(key))
@@ -842,18 +845,42 @@ inline void ColumnarMemTable::SealActiveBlockIfNeeded() {
     std::lock_guard<std::mutex> lock(seal_mutex_);
     auto b = std::atomic_load(&active_block_);
     if (b->size() < active_block_threshold_ || b->is_sealed()) return;
+
     b->Seal();
     auto new_b = std::make_shared<FlashActiveBlock>(active_block_threshold_);
     std::atomic_exchange(&active_block_, new_b);
     seal_sequence_.fetch_add(1, std::memory_order_release);
+
     auto cb = std::make_shared<ColumnarBlock>();
-    for (const auto& r : *b) cb->Add(r.key, r.value, r.type);
+
+    {
+        ColumnarRecordArena& arena_to_copy = b->data_log_;
+
+        std::vector<const ColumnarRecordArena::ThreadLocalData*> tls_data_snapshot;
+        {
+            std::lock_guard<std::mutex> arena_lock(arena_to_copy.registration_mutex_);
+            for (const auto& tls_ptr : arena_to_copy.all_tls_data_) {
+                tls_data_snapshot.push_back(tls_ptr.get());
+            }
+        }
+
+        for (const auto* tls_data : tls_data_snapshot) {
+            for (const auto& chunk_ptr : tls_data->chunks) {
+                for (uint32_t i = 0; i < chunk_ptr->write_idx; ++i) {
+                    const auto& rec = chunk_ptr->records[i].record;
+                    cb->Add(rec.key, rec.value, rec.type);
+                }
+            }
+        }
+    }
+    
     if (!cb->empty()) {
         std::lock_guard<std::mutex> ql(queue_mutex_);
         sealed_blocks_queue_.push_back(std::move(cb));
     }
     queue_cond_.notify_one();
 }
+
 inline void ColumnarMemTable::WaitForBackgroundWork() {
     std::unique_lock<std::mutex> lock(queue_mutex_);
     queue_cond_.wait(lock, [this] { return sealed_blocks_queue_.empty() && !background_thread_processing_; });
@@ -905,13 +932,17 @@ inline void ColumnarMemTable::BackgroundWorkerLoop() {
 }
 inline void ColumnarMemTable::ProcessBlocks(std::vector<std::shared_ptr<ColumnarBlock>> blocks) {
     if (blocks.empty()) return;
+
     auto old_s = std::atomic_load(&immutable_state_);
     auto new_list = std::make_shared<ImmutableState::SortedBlockList>();
     std::vector<std::shared_ptr<const SortedColumnarBlock>> to_merge;
-    if (enable_compaction_)
+    
+    if (enable_compaction_) {
         to_merge.insert(to_merge.end(), old_s->blocks->begin(), old_s->blocks->end());
-    else
+    } else {
         *new_list = *old_s->blocks;
+    }
+
     for (const auto& b : blocks) {
         if (b->empty()) continue;
         auto sb = std::make_shared<const SortedColumnarBlock>(b, *sorter_);
@@ -920,6 +951,7 @@ inline void ColumnarMemTable::ProcessBlocks(std::vector<std::shared_ptr<Columnar
         else
             new_list->push_back(std::move(sb));
     }
+    
     if (enable_compaction_ && to_merge.size() > 1) {
         auto fcb = std::make_shared<ColumnarBlock>();
         CompactingIterator it(std::make_unique<FlushIterator>(std::move(to_merge)));
@@ -930,18 +962,21 @@ inline void ColumnarMemTable::ProcessBlocks(std::vector<std::shared_ptr<Columnar
         }
         new_list->clear();
         if (!fcb->empty()) new_list->push_back(std::make_shared<const SortedColumnarBlock>(fcb, *sorter_));
-    } else if (enable_compaction_)
+    } else if (enable_compaction_) {
         *new_list = to_merge;
+    }
+
     auto new_s = std::make_shared<ImmutableState>();
     new_s->blocks = std::move(new_list);
     auto meta_cache = std::make_shared<std::vector<ImmutableState::MetaInfo>>();
     if (new_s->blocks) {
         meta_cache->reserve(new_s->blocks->size());
         for (const auto& b : *new_s->blocks) {
-            if (b && !b->empty()) meta_cache->emplace_back(b->min_key(), b->max_key(), b.get());
+            if (b && !b->empty()) meta_cache->emplace_back(b->min_key(), b->max_key(), b);
         }
     }
     new_s->read_meta_cache = std::move(meta_cache);
+    
     std::atomic_store(&immutable_state_, std::shared_ptr<const ImmutableState>(std::move(new_s)));
 }
 
