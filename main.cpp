@@ -140,7 +140,7 @@ void RunAllFor(const std::string& type_name) {
 const int NUM_OPS = 500'000;
 const size_t KEY_LEN = 16;
 const size_t VAL_LEN = 100;
-const size_t BLOCK_SIZE_BYTES = 16 * 1024 * 32;
+const size_t BLOCK_SIZE_BYTES = 16 * 1024 * 116;
 const unsigned int NUM_THREADS = std::thread::hardware_concurrency();
 
 using StringPair = std::pair<std::string, std::string>;
@@ -337,6 +337,7 @@ void RegisterBenchmarksForType(const std::string& type_name) {
     static std::vector<std::string> benchmark_names;
 
     for (int compaction_arg : {0, 1}) {
+
         if (type_name == "SkipListMemTable" && compaction_arg == 1) {
             continue;
         }
