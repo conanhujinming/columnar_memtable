@@ -794,7 +794,7 @@ inline void CompactingIterator::FindNext() {
     is_valid_ = false;
 }
 
-class ColumnarMemTable {
+class ColumnarMemTable : public std::enable_shared_from_this<ColumnarMemTable> {
    public:
     using GetResult = std::optional<std::string_view>;
     using MultiGetResult = std::map<std::string_view, GetResult, std::less<>>;
@@ -840,7 +840,10 @@ class ColumnarMemTable {
     void SealActiveBlockIfNeeded();
     void BackgroundWorkerLoop();
     void ProcessBlocks(std::vector<BackgroundWorkItem> work_items);
+    
     FlashActiveBlock* GetActiveBlockForThread(bool force_refresh = false) const;
+    const ImmutableState* GetImmutableStateForThread() const;
+
     size_t active_block_threshold_;
     const bool enable_compaction_;
     std::shared_ptr<Sorter> sorter_;
@@ -866,13 +869,26 @@ inline ColumnarMemTable::~ColumnarMemTable() {
 }
 
 inline std::shared_ptr<ColumnarBlock> ColumnarMemTable::GetPooledColumnarBlock() {
-    auto recycler_deleter = [this](ColumnarBlock* ptr) {
-        ptr->Clear();
-        {
-            std::lock_guard<std::mutex> lock(pool_mutex_);
-            columnar_block_pool_.emplace_back(ptr);
+    // Create a weak_ptr to self. This is safe because ColumnarMemTable
+    // now inherits from enable_shared_from_this.
+    std::weak_ptr<ColumnarMemTable> weak_self = shared_from_this();
+
+    auto recycler_deleter = [weak_self](ColumnarBlock* ptr) {
+        // Try to lock the weak_ptr to see if the MemTable still exists.
+        if (auto shared_self = weak_self.lock()) {
+            // The MemTable is still alive, so we can safely return the block to its pool.
+            ptr->Clear();
+            {
+                std::lock_guard<std::mutex> lock(shared_self->pool_mutex_);
+                shared_self->columnar_block_pool_.emplace_back(ptr);
+            }
+        } else {
+            // The MemTable has been destroyed. We can't return the block to the pool.
+            // The only thing we can do is to delete it directly.
+            delete ptr;
         }
     };
+
     std::lock_guard<std::mutex> lock(pool_mutex_);
     if (!columnar_block_pool_.empty()) {
         std::unique_ptr<ColumnarBlock> block_ptr = std::move(columnar_block_pool_.back());
@@ -882,37 +898,38 @@ inline std::shared_ptr<ColumnarBlock> ColumnarMemTable::GetPooledColumnarBlock()
     return std::shared_ptr<ColumnarBlock>(new ColumnarBlock(), recycler_deleter);
 }
 
-inline FlashActiveBlock* ColumnarMemTable::GetActiveBlockForThread(bool force_refresh) const {
-    thread_local FlashActiveBlock* active_block_cache = nullptr;
-    thread_local uint64_t last_seen_seal_sequence = -1;
-    uint64_t current_sequence = seal_sequence_.load(std::memory_order_acquire);
-    if (force_refresh || active_block_cache == nullptr || last_seen_seal_sequence != current_sequence) {
-        active_block_cache = std::atomic_load(&active_block_).get();
-        last_seen_seal_sequence = current_sequence;
-    }
-    return active_block_cache;
-}
+
 inline void ColumnarMemTable::Insert(std::string_view k, std::string_view v, RecordType t) {
     FlashActiveBlock* current_block = GetActiveBlockForThread();
     while (!current_block->TryAdd(k, v, t)) {
+        // Force refresh the cache after a failed add, as it likely means the block was sealed.
         current_block = GetActiveBlockForThread(true);
     }
     if (current_block->size() >= active_block_threshold_) {
         SealActiveBlockIfNeeded();
     }
 }
+
 inline void ColumnarMemTable::Put(std::string_view k, std::string_view v) { Insert(k, v, RecordType::Put); }
 inline void ColumnarMemTable::Delete(std::string_view k) { Insert(k, "", RecordType::Delete); }
 inline void ColumnarMemTable::PutBatch(const std::vector<std::pair<std::string_view, std::string_view>>& batch) {
     for (const auto& [k, v] : batch) Insert(k, v, RecordType::Put);
 }
 inline ColumnarMemTable::GetResult ColumnarMemTable::Get(std::string_view key) const {
+    // 1. Check the active block (fast path, uses TLS cache).
     FlashActiveBlock* active_block = GetActiveBlockForThread();
     if (auto r = active_block->Get(key)) {
         return (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt;
     }
-    auto s = std::atomic_load(&immutable_state_);
+
+    // 2. Get the immutable state (fast path, uses TLS cache and returns a raw pointer).
+    // NO reference counting operations happen here on the hot path.
+    const ImmutableState* s = GetImmutableStateForThread();
+    
+    // 3. Search immutable blocks.
     if (s && s->read_meta_cache) {
+        // The linear scan here is still a bottleneck if there are many blocks,
+        // but we have removed the shared_ptr contention.
         for (auto it = s->read_meta_cache->rbegin(); it != s->read_meta_cache->rend(); ++it) {
             const auto& [min_k, max_k, ptr] = *it;
             if (key >= min_k && key <= max_k) {
@@ -926,9 +943,14 @@ inline ColumnarMemTable::GetResult ColumnarMemTable::Get(std::string_view key) c
 inline ColumnarMemTable::MultiGetResult ColumnarMemTable::MultiGet(const std::vector<std::string_view>& keys) const {
     MultiGetResult results;
     if (keys.empty()) return results;
+    
     std::vector<std::string_view> remaining_keys;
     remaining_keys.reserve(keys.size());
+
+    // Get thread-local pointers once for the entire batch operation.
     FlashActiveBlock* active_block = GetActiveBlockForThread();
+    const ImmutableState* global_state = GetImmutableStateForThread();
+
     for (const auto& k : keys) {
         if (auto r = active_block->Get(k)) {
             results.emplace(k, (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt);
@@ -936,13 +958,18 @@ inline ColumnarMemTable::MultiGetResult ColumnarMemTable::MultiGet(const std::ve
             remaining_keys.push_back(k);
         }
     }
+
     if (remaining_keys.empty()) return results;
-    auto global_state = std::atomic_load(&immutable_state_);
+
     if (global_state && global_state->read_meta_cache) {
+        // Sorting keys can help with cache coherency when scanning blocks.
         std::sort(remaining_keys.begin(), remaining_keys.end());
+        
         for (auto block_it = global_state->read_meta_cache->rbegin(); block_it != global_state->read_meta_cache->rend(); ++block_it) {
             if (remaining_keys.empty()) break;
             const auto& [min_k, max_k, block_ptr] = *block_it;
+            
+            // This loop can be improved further, but for now, let's fix the contention.
             for (auto key_it = remaining_keys.begin(); key_it != remaining_keys.end(); ) {
                  if (results.count(*key_it) == 0 && *key_it >= min_k && *key_it <= max_k) {
                     if (auto r = block_ptr->Get(*key_it)) {
@@ -953,6 +980,14 @@ inline ColumnarMemTable::MultiGetResult ColumnarMemTable::MultiGet(const std::ve
             }
         }
     }
+    // Any keys not found in active or immutable are considered non-existent.
+    // The benchmark framework may require an entry for every key, so we ensure that.
+    for(const auto& k : remaining_keys) {
+        if (results.find(k) == results.end()) {
+             results.emplace(k, std::nullopt);
+        }
+    }
+    
     return results;
 }
 inline void ColumnarMemTable::SealActiveBlockIfNeeded() {
@@ -1052,6 +1087,42 @@ inline void ColumnarMemTable::BackgroundWorkerLoop() {
         }
         queue_cond_.notify_all();
     }
+}
+
+inline FlashActiveBlock* ColumnarMemTable::GetActiveBlockForThread(bool force_refresh) const {
+    thread_local FlashActiveBlock* active_block_cache = nullptr;
+    thread_local uint64_t last_seen_seal_sequence = -1;
+    
+    // seal_sequence_ is the cheap version counter
+    uint64_t current_sequence = seal_sequence_.load(std::memory_order_acquire);
+    
+    if (force_refresh || active_block_cache == nullptr || last_seen_seal_sequence != current_sequence) {
+        // This is the "slow path", where we take the hit of an atomic shared_ptr load.
+        // This only happens when a seal operation completes.
+        active_block_cache = std::atomic_load(&active_block_).get();
+        last_seen_seal_sequence = current_sequence;
+    }
+    return active_block_cache;
+}
+
+inline const ColumnarMemTable::ImmutableState* ColumnarMemTable::GetImmutableStateForThread() const {
+    // We use the same seal_sequence_ to version the immutable state.
+    // The background thread guarantees that it processes a seal *before* updating immutable_state_.
+    // So, a new sequence number implies the immutable state *might* have changed.
+    thread_local std::shared_ptr<const ImmutableState> immutable_state_cache;
+    thread_local uint64_t last_seen_seal_sequence = -1;
+
+    uint64_t current_sequence = seal_sequence_.load(std::memory_order_acquire);
+
+    if (immutable_state_cache == nullptr || last_seen_seal_sequence != current_sequence) {
+        // Slow path: atomically load the shared_ptr, incurring a ref-count bump.
+        immutable_state_cache = std::atomic_load(&immutable_state_);
+        last_seen_seal_sequence = current_sequence;
+    }
+    
+    // Fast path: return the raw pointer from the thread-local shared_ptr.
+    // No ref-count operations here!
+    return immutable_state_cache.get();
 }
 
 // --- FIX START: ProcessBlocks now handles barrier work items ---
