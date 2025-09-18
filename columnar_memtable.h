@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -21,7 +22,6 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-#include <future>
 
 #define XXH_INLINE_ALL
 #include "xxhash.h"
@@ -48,11 +48,9 @@ struct XXHasher {
 inline uint64_t load_u64_prefix(std::string_view sv) {
     if (sv.size() >= 8) {
         uint64_t prefix;
-        // Use memcpy for strict-aliasing safe type punning
         memcpy(&prefix, sv.data(), 8);
         return prefix;
     }
-    // For keys shorter than 8 bytes, pad with zeros
     uint64_t prefix = 0;
     if (!sv.empty()) {
         memcpy(&prefix, sv.data(), sv.size());
@@ -67,7 +65,7 @@ struct RecordRef {
     RecordType type;
 };
 
-// --- Bloom Filter (Unchanged) ---
+// --- Bloom Filter ---
 class BloomFilter {
    public:
     explicit BloomFilter(size_t num_entries, double false_positive_rate = 0.01);
@@ -109,17 +107,19 @@ inline std::array<uint64_t, 2> BloomFilter::Hash(std::string_view key) {
 // --- Columnar MemTable Components ---
 struct StoredRecord {
     RecordRef record;
+    std::atomic<bool> ready{false};
 };
 
-class ColumnarMemTable; 
+class ColumnarMemTable;
 class ColumnarRecordArena {
    private:
-    friend class ColumnarMemTable; 
+    friend class ColumnarMemTable;
     friend class Iterator;
     struct DataChunk {
         static constexpr size_t kRecordCapacity = 256;
         static constexpr size_t kBufferCapacity = 32 * 1024;
-        uint32_t write_idx{0}, buffer_pos{0};
+        std::atomic<uint32_t> write_idx{0};
+        std::atomic<uint32_t> buffer_pos{0};
         std::array<StoredRecord, kRecordCapacity> records;
         alignas(64) char buffer[kBufferCapacity];
     };
@@ -142,14 +142,13 @@ class ColumnarRecordArena {
     class Iterator;
     ColumnarRecordArena() : id_(next_id_.fetch_add(1, std::memory_order_relaxed)), size_(0) {}
     ~ColumnarRecordArena() {
-        auto& tls_map = GetTlsMap();  // 使用辅助函数
-
+        auto& tls_map = GetTlsMap();
         if (tls_map.count(id_)) {
             tls_map.erase(id_);
         }
     }
     const StoredRecord* AllocateAndAppend(std::string_view key, std::string_view value, RecordType type);
-    size_t size() const { return size_.load(std::memory_order_relaxed); }
+    size_t size() const { return size_.load(std::memory_order_acquire); }
     Iterator begin() const;
     Iterator end() const;
 
@@ -186,15 +185,19 @@ class ConcurrentStringHashMap {
     void Insert(std::string_view key, const StoredRecord* new_record);
     const StoredRecord* Find(std::string_view key) const;
 };
+
 class ColumnarRecordArena::Iterator {
    public:
     const RecordRef& operator*() const {
         return arena_->all_tls_data_[tls_idx_]->chunks[chunk_idx_]->records[record_idx_].record;
     }
+
     Iterator& operator++() {
+        record_idx_++;
         advance();
         return *this;
     }
+
     bool operator!=(const Iterator& other) const {
         return tls_idx_ != other.tls_idx_ || chunk_idx_ != other.chunk_idx_ || record_idx_ != other.record_idx_;
     }
@@ -203,43 +206,50 @@ class ColumnarRecordArena::Iterator {
     friend class ColumnarRecordArena;
     Iterator(const ColumnarRecordArena* arena, size_t tls_idx, size_t chunk_idx, size_t record_idx)
         : arena_(arena), tls_idx_(tls_idx), chunk_idx_(chunk_idx), record_idx_(record_idx) {}
+
+    void advance() {
+        while (tls_idx_ < arena_->all_tls_data_.size()) {
+            const auto& tls_data = arena_->all_tls_data_[tls_idx_];
+            while (chunk_idx_ < tls_data->chunks.size()) {
+                const auto& chunk = tls_data->chunks[chunk_idx_];
+
+                uint32_t limit = chunk->write_idx.load(std::memory_order_relaxed);
+                if (limit > DataChunk::kRecordCapacity) {
+                    limit = DataChunk::kRecordCapacity;
+                }
+
+                while (record_idx_ < limit) {
+                    if (chunk->records[record_idx_].ready.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    record_idx_++;
+                }
+
+                chunk_idx_++;
+                record_idx_ = 0;
+            }
+            tls_idx_++;
+            chunk_idx_ = 0;
+            record_idx_ = 0;
+        }
+
+        tls_idx_ = arena_->all_tls_data_.size();
+        chunk_idx_ = 0;
+        record_idx_ = 0;
+    }
+
     const ColumnarRecordArena* arena_;
     size_t tls_idx_;
     size_t chunk_idx_;
     size_t record_idx_;
-    void advance() {
-        if (tls_idx_ >= arena_->all_tls_data_.size()) return;
-        record_idx_++;
-        while (true) {
-            const auto& tls_data = arena_->all_tls_data_[tls_idx_];
-            if (chunk_idx_ < tls_data->chunks.size()) {
-                if (record_idx_ < tls_data->chunks[chunk_idx_]->write_idx) return;
-                chunk_idx_++;
-                record_idx_ = 0;
-            } else {
-                tls_idx_++;
-                chunk_idx_ = 0;
-                record_idx_ = 0;
-                if (tls_idx_ >= arena_->all_tls_data_.size()) return;
-            }
-        }
-    }
 };
+
 inline ColumnarRecordArena::Iterator ColumnarRecordArena::begin() const {
-    size_t start_tls = 0, start_chunk = 0, start_record = 0;
-    while (start_tls < all_tls_data_.size()) {
-        const auto& tls_data = all_tls_data_[start_tls];
-        while (start_chunk < tls_data->chunks.size()) {
-            if (start_record < tls_data->chunks[start_chunk]->write_idx)
-                return Iterator(this, start_tls, start_chunk, start_record);
-            start_chunk++;
-            start_record = 0;
-        }
-        start_tls++;
-        start_chunk = 0;
-    }
-    return end();
+    Iterator it(this, 0, 0, 0);
+    it.advance();
+    return it;
 }
+
 inline ColumnarRecordArena::Iterator ColumnarRecordArena::end() const {
     return Iterator(this, all_tls_data_.size(), 0, 0);
 }
@@ -260,23 +270,35 @@ inline ColumnarRecordArena::ThreadLocalData* ColumnarRecordArena::GetTlsData() {
 inline const StoredRecord* ColumnarRecordArena::AllocateAndAppend(std::string_view key, std::string_view value,
                                                                   RecordType type) {
     ThreadLocalData* tls_data = GetTlsData();
-    size_t required_size = key.size() + value.size();
     DataChunk* chunk = tls_data->current_chunk;
-    if (chunk->buffer_pos + required_size > DataChunk::kBufferCapacity ||
-        chunk->write_idx >= DataChunk::kRecordCapacity) {
+    size_t required_size = key.size() + value.size();
+
+    uint32_t record_idx = chunk->write_idx.fetch_add(1, std::memory_order_relaxed);
+
+    if (record_idx >= DataChunk::kRecordCapacity) {
         tls_data->AddNewChunk();
-        chunk = tls_data->current_chunk;
+        return nullptr;
     }
-    char* key_mem = chunk->buffer + chunk->buffer_pos;
+
+    uint32_t buffer_offset = chunk->buffer_pos.fetch_add(required_size, std::memory_order_relaxed);
+
+    if (buffer_offset + required_size > DataChunk::kBufferCapacity) {
+        tls_data->AddNewChunk();
+        return nullptr;
+    }
+
+    char* key_mem = chunk->buffer + buffer_offset;
     memcpy(key_mem, key.data(), key.size());
     char* val_mem = key_mem + key.size();
     memcpy(val_mem, value.data(), value.size());
-    StoredRecord& record = chunk->records[chunk->write_idx];
-    record.record = {{key_mem, key.size()}, {val_mem, value.size()}, type};
-    chunk->buffer_pos += required_size;
-    chunk->write_idx++;
-    size_.fetch_add(1, std::memory_order_relaxed);
-    return &record;
+
+    StoredRecord& record_slot = chunk->records[record_idx];
+    record_slot.record = {{key_mem, key.size()}, {val_mem, value.size()}, type};
+
+    record_slot.ready.store(true, std::memory_order_release);
+
+    size_.fetch_add(1, std::memory_order_release);
+    return &record_slot;
 }
 inline ConcurrentStringHashMap::ConcurrentStringHashMap(size_t build_size) {
     size_t capacity = calculate_power_of_2(build_size * 3.0);
@@ -325,7 +347,11 @@ inline const StoredRecord* ConcurrentStringHashMap::Find(std::string_view key) c
         uint8_t current_tag = slots_[pos].tag.load(std::memory_order_acquire);
         if (current_tag == EMPTY_TAG) return nullptr;
         if (current_tag == tag && slots_[pos].full_hash == hash && slots_[pos].key == key) {
-            return slots_[pos].record.load(std::memory_order_acquire);
+            const StoredRecord* rec = slots_[pos].record.load(std::memory_order_acquire);
+            if (rec && rec->ready.load(std::memory_order_acquire)) {
+                return rec;
+            }
+            return nullptr;
         }
         pos = (pos + 1) & capacity_mask_;
     } while (pos != initial_pos);
@@ -333,6 +359,7 @@ inline const StoredRecord* ConcurrentStringHashMap::Find(std::string_view key) c
 }
 class FlashActiveBlock {
     friend class ColumnarMemTable;
+
    public:
     explicit FlashActiveBlock(size_t cap) : index_(cap) {}
     ~FlashActiveBlock() {}
@@ -350,9 +377,24 @@ class FlashActiveBlock {
     std::atomic<bool> sealed_{false};
 };
 inline bool FlashActiveBlock::TryAdd(std::string_view key, std::string_view value, RecordType type) {
-    if (is_sealed()) return false;
-    const StoredRecord* record_ptr = data_log_.AllocateAndAppend(key, value, type);
-    if (record_ptr) index_.Insert(record_ptr->record.key, record_ptr);
+    if (is_sealed()) {
+        return false;
+    }
+
+    const StoredRecord* record_ptr;
+    while (true) {
+        record_ptr = data_log_.AllocateAndAppend(key, value, type);
+        if (record_ptr) {
+            break;
+        }
+        if (is_sealed()) {
+            return false;
+        }
+    }
+
+    if (record_ptr) {
+        index_.Insert(record_ptr->record.key, record_ptr);
+    }
     return record_ptr != nullptr;
 }
 inline std::optional<RecordRef> FlashActiveBlock::Get(std::string_view key) const {
@@ -385,7 +427,7 @@ class ColumnarBlock {
         keys.clear();
         values.clear();
         types.clear();
-        arena = SimpleArena(); 
+        arena = SimpleArena();
     }
 };
 inline char* ColumnarBlock::SimpleArena::AllocateRaw(size_t bytes) {
@@ -427,7 +469,7 @@ class StdSorter : public Sorter {
 };
 
 class ParallelRadixSorter : public Sorter {
-public:
+   public:
     std::vector<uint32_t> Sort(const ColumnarBlock& block) const override {
         if (block.empty()) return {};
         std::vector<uint32_t> indices(block.size());
@@ -437,11 +479,11 @@ public:
         if (num_threads == 0) num_threads = 1;
 
         radix_sort_msd_parallel(indices.begin(), indices.end(), 0, num_threads, block);
-        
+
         return indices;
     }
 
-private:
+   private:
     static constexpr size_t kSequentialSortThreshold = 2048;
     static constexpr size_t kRadixAlphabetSize = 256;
 
@@ -458,7 +500,7 @@ private:
 
         if (static_cast<size_t>(std::distance(begin, end)) <= kSequentialSortThreshold) {
             std::stable_sort(begin, end, [&](uint32_t a, uint32_t b) {
-                return block.keys[a].substr(std::min(depth, block.keys[a].size())) < 
+                return block.keys[a].substr(std::min(depth, block.keys[a].size())) <
                        block.keys[b].substr(std::min(depth, block.keys[b].size()));
             });
             return;
@@ -475,7 +517,7 @@ private:
                 buckets[char_code].push_back(*it);
             }
         }
-        
+
         auto current = begin;
         std::copy(finished_strings.begin(), finished_strings.end(), current);
         current += finished_strings.size();
@@ -489,60 +531,52 @@ private:
             }
         }
     }
-    
-    void radix_sort_msd_parallel(Iterator begin, Iterator end, size_t depth, unsigned int num_threads, const ColumnarBlock& block) const {
+
+    void radix_sort_msd_parallel(Iterator begin, Iterator end, size_t depth, unsigned int num_threads,
+                                 const ColumnarBlock& block) const {
         const size_t size = std::distance(begin, end);
         if (size <= kSequentialSortThreshold || num_threads <= 1) {
             radix_sort_msd_sequential(begin, end, depth, block);
             return;
         }
 
-        // 1. Count frequencies of each character.
-        // bucket_counts[0] is for finished strings (char_code -1)
-        // bucket_counts[1] is for char 0, etc.
         std::vector<size_t> bucket_counts(kRadixAlphabetSize + 1, 0);
         for (auto it = begin; it != end; ++it) {
             bucket_counts[get_char_at(block.keys[*it], depth) + 1]++;
         }
-        
-        // 2. Calculate starting offsets for each bucket in the output.
+
         std::vector<size_t> bucket_offsets(kRadixAlphabetSize + 2, 0);
-        for(size_t i = 0; i < kRadixAlphabetSize + 1; ++i) {
-            bucket_offsets[i+1] = bucket_offsets[i] + bucket_counts[i];
+        for (size_t i = 0; i < kRadixAlphabetSize + 1; ++i) {
+            bucket_offsets[i + 1] = bucket_offsets[i] + bucket_counts[i];
         }
 
-        // 3. Distribute elements into a temporary output buffer based on their bucket.
-        // This is the core fix: using a separate output buffer avoids data corruption.
         std::vector<uint32_t> sorted_output(size);
-        std::vector<size_t> current_offsets = bucket_offsets; // Copy offsets to use as write cursors.
+        std::vector<size_t> current_offsets = bucket_offsets;
 
         for (auto it = begin; it != end; ++it) {
             uint32_t val = *it;
             int char_code = get_char_at(block.keys[val], depth);
             sorted_output[current_offsets[char_code + 1]++] = val;
         }
-        
-        // 4. Copy the correctly sorted data from the buffer back to the original range.
+
         std::copy(sorted_output.begin(), sorted_output.end(), begin);
 
-        // 5. Parallel recursive sorting on each bucket.
         std::vector<std::thread> threads;
         threads.reserve(num_threads);
-        
-        // Start from i=1 (char_code 0). Bucket 0 (char_code -1) is already sorted.
+
         for (size_t i = 1; i < kRadixAlphabetSize + 1; ++i) {
             size_t bucket_size = bucket_counts[i];
             if (bucket_size == 0) continue;
 
             Iterator bucket_begin = begin + bucket_offsets[i];
-            Iterator bucket_end = begin + bucket_offsets[i+1];
-            
+            Iterator bucket_end = begin + bucket_offsets[i + 1];
+
             if (threads.size() < num_threads - 1 && bucket_size > kSequentialSortThreshold) {
-                 threads.emplace_back([this, bucket_begin, bucket_end, depth, num_threads, &block] {
+                threads.emplace_back([this, bucket_begin, bucket_end, depth, num_threads, &block] {
                     unsigned int threads_for_child = (num_threads + 1) / 2;
                     radix_sort_msd_parallel(bucket_begin, bucket_end, depth + 1, threads_for_child, block);
-                 });
-            } else { 
+                });
+            } else {
                 radix_sort_msd_sequential(bucket_begin, bucket_end, depth + 1, block);
             }
         }
@@ -672,7 +706,7 @@ inline FlushIterator::FlushIterator(std::vector<std::shared_ptr<const SortedColu
         iterators_.emplace_back(sources_[i]->begin());
         size_t current_iterator_index = iterators_.size() - 1;
         RecordRef rec = *iterators_.back();
-        
+
         uint64_t prefix = load_u64_prefix(rec.key);
         min_heap_.push({rec, prefix, i, current_iterator_index});
     }
@@ -739,15 +773,16 @@ inline void CompactingIterator::FindNext() {
         }
     }
 }
+
 class ColumnarMemTable {
    public:
     using GetResult = std::optional<std::string_view>;
     using MultiGetResult = std::map<std::string_view, GetResult, std::less<>>;
     explicit ColumnarMemTable(size_t active_block_size_bytes = 16 * 1024 * 48, bool enable_compaction = false,
-                              std::shared_ptr<Sorter> sorter = std::make_shared<ParallelRadixSorter>()) // Use new sorter
-    : active_block_threshold_(std::max((size_t)1, active_block_size_bytes / 116)),
-      enable_compaction_(enable_compaction),
-      sorter_(std::move(sorter)) {
+                              std::shared_ptr<Sorter> sorter = std::make_shared<ParallelRadixSorter>())
+        : active_block_threshold_(std::max((size_t)1, active_block_size_bytes / 116)),
+          enable_compaction_(enable_compaction),
+          sorter_(std::move(sorter)) {
         active_block_ = std::make_shared<FlashActiveBlock>(active_block_threshold_);
         immutable_state_ = std::make_shared<const ImmutableState>();
         background_thread_ = std::thread(&ColumnarMemTable::BackgroundWorkerLoop, this);
@@ -766,14 +801,12 @@ class ColumnarMemTable {
    private:
     struct ImmutableState {
         using SortedBlockList = std::vector<std::shared_ptr<const SortedColumnarBlock>>;
-        
         using MetaInfo = std::tuple<std::string_view, std::string_view, std::shared_ptr<const SortedColumnarBlock>>;
-        
         std::shared_ptr<const SortedBlockList> blocks;
         std::shared_ptr<const std::vector<MetaInfo>> read_meta_cache;
         ImmutableState()
             : blocks(std::make_shared<const SortedBlockList>()),
-            read_meta_cache(std::make_shared<const std::vector<MetaInfo>>()) {}
+              read_meta_cache(std::make_shared<const std::vector<MetaInfo>>()) {}
     };
     std::unique_ptr<FlushIterator> NewRawFlushIterator();
     std::vector<std::shared_ptr<ColumnarBlock>> columnar_block_pool_;
@@ -781,16 +814,20 @@ class ColumnarMemTable {
     void Insert(std::string_view key, std::string_view value, RecordType type);
     void SealActiveBlockIfNeeded();
     void BackgroundWorkerLoop();
-    void ProcessBlocks(std::vector<std::shared_ptr<ColumnarBlock>> blocks);
+    void ProcessBlocks(std::vector<std::shared_ptr<FlashActiveBlock>> sealed_blocks);
     FlashActiveBlock* GetActiveBlockForThread(bool force_refresh = false) const;
-    const size_t active_block_threshold_;
+
+    size_t active_block_threshold_;
     const bool enable_compaction_;
     std::shared_ptr<Sorter> sorter_;
+
     std::shared_ptr<FlashActiveBlock> active_block_;
     std::shared_ptr<const ImmutableState> immutable_state_;
+
     alignas(64) std::atomic<uint64_t> seal_sequence_{0};
     std::mutex seal_mutex_;
-    std::vector<std::shared_ptr<ColumnarBlock>> sealed_blocks_queue_;
+
+    std::vector<std::shared_ptr<FlashActiveBlock>> sealed_blocks_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cond_;
     std::thread background_thread_;
@@ -826,9 +863,11 @@ inline FlashActiveBlock* ColumnarMemTable::GetActiveBlockForThread(bool force_re
 inline void ColumnarMemTable::Insert(std::string_view k, std::string_view v, RecordType t) {
     FlashActiveBlock* current_block = GetActiveBlockForThread();
     while (!current_block->TryAdd(k, v, t)) {
-        current_block = GetActiveBlockForThread(true);  // Force refresh
+        current_block = GetActiveBlockForThread(true);
     }
-    if (current_block->size() >= active_block_threshold_) SealActiveBlockIfNeeded();
+    if (current_block->size() >= active_block_threshold_) {
+        SealActiveBlockIfNeeded();
+    }
 }
 
 inline void ColumnarMemTable::Put(std::string_view k, std::string_view v) { Insert(k, v, RecordType::Put); }
@@ -839,17 +878,14 @@ inline void ColumnarMemTable::PutBatch(const std::vector<std::pair<std::string_v
 
 inline ColumnarMemTable::GetResult ColumnarMemTable::Get(std::string_view key) const {
     FlashActiveBlock* active_block = GetActiveBlockForThread();
-    if (auto r = active_block->Get(key)) return (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt;
-    auto s = std::atomic_load(&immutable_state_);
-    thread_local const ImmutableState* last_s = nullptr;
-    thread_local const std::vector<ImmutableState::MetaInfo>* cache = nullptr;
-    if (last_s != s.get()) {
-        last_s = s.get();
-        cache = last_s->read_meta_cache.get();
+    if (auto r = active_block->Get(key)) {
+        return (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt;
     }
-    if (cache) {
-        for (auto it = cache->rbegin(); it != cache->rend(); ++it) {
-            const auto& [min_k, max_k, ptr] = *it; 
+
+    auto s = std::atomic_load(&immutable_state_);
+    if (s && s->read_meta_cache) {
+        for (auto it = s->read_meta_cache->rbegin(); it != s->read_meta_cache->rend(); ++it) {
+            const auto& [min_k, max_k, ptr] = *it;
             if (key >= min_k && key <= max_k) {
                 if (ptr->MayContain(key)) {
                     if (auto r = ptr->Get(key))
@@ -860,35 +896,40 @@ inline ColumnarMemTable::GetResult ColumnarMemTable::Get(std::string_view key) c
     }
     return std::nullopt;
 }
+
 inline ColumnarMemTable::MultiGetResult ColumnarMemTable::MultiGet(const std::vector<std::string_view>& keys) const {
     MultiGetResult results;
     if (keys.empty()) return results;
+
     std::vector<std::string_view> remaining_keys;
     remaining_keys.reserve(keys.size());
+
     FlashActiveBlock* active_block = GetActiveBlockForThread();
     for (const auto& k : keys) {
-        if (!results.count(k)) {
-            if (auto r = active_block->Get(k))
+        if (results.count(k) == 0) {
+            if (auto r = active_block->Get(k)) {
                 results.emplace(k, (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt);
-            else
+            } else {
                 remaining_keys.push_back(k);
+            }
         }
     }
+
     if (remaining_keys.empty()) return results;
+
     auto global_state = std::atomic_load(&immutable_state_);
-    thread_local const ImmutableState* last_seen_state = nullptr;
-    thread_local const std::vector<ImmutableState::MetaInfo>* local_meta_cache_ptr = nullptr;
-    if (last_seen_state != global_state.get()) {
-        last_seen_state = global_state.get();
-        local_meta_cache_ptr = last_seen_state->read_meta_cache.get();
+    if (!global_state || !global_state->read_meta_cache || global_state->read_meta_cache->empty()) {
+        return results;
     }
-    if (!local_meta_cache_ptr || local_meta_cache_ptr->empty()) return results;
+
     std::sort(remaining_keys.begin(), remaining_keys.end());
-    for (auto block_it = local_meta_cache_ptr->rbegin(); block_it != local_meta_cache_ptr->rend(); ++block_it) {
+    for (auto block_it = global_state->read_meta_cache->rbegin(); block_it != global_state->read_meta_cache->rend();
+         ++block_it) {
         if (remaining_keys.empty()) break;
         const auto& [min_k, max_k, block_ptr] = *block_it;
         std::vector<std::string_view> next_remaining_keys;
         next_remaining_keys.reserve(remaining_keys.size());
+
         for (auto key_it = remaining_keys.begin(); key_it != remaining_keys.end(); ++key_it) {
             const auto& key = *key_it;
             if (key > max_k) {
@@ -905,7 +946,7 @@ inline ColumnarMemTable::MultiGetResult ColumnarMemTable::MultiGet(const std::ve
                 } else {
                     next_remaining_keys.push_back(key);
                 }
-            } else {
+            } else {  // key < min_k
                 next_remaining_keys.push_back(key);
             }
         }
@@ -913,56 +954,23 @@ inline ColumnarMemTable::MultiGetResult ColumnarMemTable::MultiGet(const std::ve
     }
     return results;
 }
+
 inline void ColumnarMemTable::SealActiveBlockIfNeeded() {
     std::lock_guard<std::mutex> lock(seal_mutex_);
     auto b = std::atomic_load(&active_block_);
-    if (b->size() < active_block_threshold_ || b->is_sealed()) return;
+    if (b->size() < active_block_threshold_ || b->is_sealed()) {
+        return;
+    }
 
     b->Seal();
+
     auto new_b = std::make_shared<FlashActiveBlock>(active_block_threshold_);
     std::atomic_exchange(&active_block_, new_b);
     seal_sequence_.fetch_add(1, std::memory_order_release);
 
-    std::shared_ptr<ColumnarBlock> cb;
     {
-        std::lock_guard<std::mutex> pool_lock(pool_mutex_);
-        if (!columnar_block_pool_.empty()) {
-            cb = std::move(columnar_block_pool_.back());
-            columnar_block_pool_.pop_back();
-        }
-    }
-    if (!cb) {
-        cb = std::make_shared<ColumnarBlock>();
-    }
-
-    {
-        ColumnarRecordArena& arena_to_copy = b->data_log_;
-
-        std::vector<const ColumnarRecordArena::ThreadLocalData*> tls_data_snapshot;
-        {
-            std::lock_guard<std::mutex> arena_lock(arena_to_copy.registration_mutex_);
-            for (const auto& tls_ptr : arena_to_copy.all_tls_data_) {
-                tls_data_snapshot.push_back(tls_ptr.get());
-            }
-        }
-
-        for (const auto* tls_data : tls_data_snapshot) {
-            for (const auto& chunk_ptr : tls_data->chunks) {
-                for (uint32_t i = 0; i < chunk_ptr->write_idx; ++i) {
-                    const auto& rec = chunk_ptr->records[i].record;
-                    cb->Add(rec.key, rec.value, rec.type);
-                }
-            }
-        }
-    }
-    
-     if (!cb->empty()) {
         std::lock_guard<std::mutex> ql(queue_mutex_);
-        sealed_blocks_queue_.push_back(std::move(cb));
-    } else {
-        cb->Clear();
-        std::lock_guard<std::mutex> pool_lock(pool_mutex_);
-        columnar_block_pool_.push_back(std::move(cb));
+        sealed_blocks_queue_.push_back(std::move(b));
     }
     queue_cond_.notify_one();
 }
@@ -973,23 +981,31 @@ inline void ColumnarMemTable::WaitForBackgroundWork() {
 }
 
 inline std::unique_ptr<FlushIterator> ColumnarMemTable::NewRawFlushIterator() {
+    {
+        std::lock_guard<std::mutex> lock(seal_mutex_);
+        auto ab = std::atomic_load(&active_block_);
+
+        if (ab->size() > 0 && !ab->is_sealed()) {
+            ab->Seal();
+
+            auto new_b = std::make_shared<FlashActiveBlock>(active_block_threshold_);
+            std::atomic_exchange(&active_block_, new_b);
+            seal_sequence_.fetch_add(1, std::memory_order_release);
+
+            {
+                std::lock_guard<std::mutex> ql(queue_mutex_);
+                sealed_blocks_queue_.push_back(std::move(ab));
+            }
+            queue_cond_.notify_one();
+        }
+    }
+
     WaitForBackgroundWork();
+
     std::vector<std::shared_ptr<const SortedColumnarBlock>> all_blocks;
-    std::lock_guard<std::mutex> lock(seal_mutex_);
-
     auto s = std::atomic_load(&immutable_state_);
-    auto ab = std::atomic_load(&active_block_);
-
-    all_blocks = *s->blocks;
-
-    if (ab->size() > 0) {
-        auto tb = std::make_shared<ColumnarBlock>();
-        for (const auto& r : *ab) {
-            tb->Add(r.key, r.value, r.type);
-        }
-        if (!tb->empty()) {
-            all_blocks.push_back(std::make_shared<const SortedColumnarBlock>(tb, *sorter_));
-        }
+    if (s && s->blocks) {
+        all_blocks = *s->blocks;
     }
 
     return std::make_unique<FlushIterator>(std::move(all_blocks));
@@ -998,17 +1014,18 @@ inline std::unique_ptr<FlushIterator> ColumnarMemTable::NewRawFlushIterator() {
 inline std::unique_ptr<CompactingIterator> ColumnarMemTable::NewCompactingIterator() {
     return std::make_unique<CompactingIterator>(NewRawFlushIterator());
 }
+
 inline void ColumnarMemTable::BackgroundWorkerLoop() {
     while (true) {
-        std::vector<std::shared_ptr<ColumnarBlock>> blocks;
+        std::vector<std::shared_ptr<FlashActiveBlock>> sealed_blocks;
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             queue_cond_.wait(lock, [this] { return !sealed_blocks_queue_.empty() || stop_background_thread_; });
             if (stop_background_thread_ && sealed_blocks_queue_.empty()) return;
-            blocks.swap(sealed_blocks_queue_);
+            sealed_blocks.swap(sealed_blocks_queue_);
             background_thread_processing_ = true;
         }
-        ProcessBlocks(std::move(blocks));
+        ProcessBlocks(std::move(sealed_blocks));
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
             background_thread_processing_ = false;
@@ -1017,30 +1034,74 @@ inline void ColumnarMemTable::BackgroundWorkerLoop() {
     }
 }
 
-inline void ColumnarMemTable::ProcessBlocks(std::vector<std::shared_ptr<ColumnarBlock>> blocks) {
-    if (blocks.empty()) return;
+inline void ColumnarMemTable::ProcessBlocks(std::vector<std::shared_ptr<FlashActiveBlock>> sealed_blocks) {
+    if (sealed_blocks.empty()) return;
+
+    std::vector<std::shared_ptr<ColumnarBlock>> columnar_blocks;
+    columnar_blocks.reserve(sealed_blocks.size());
+    for (const auto& sealed_b : sealed_blocks) {
+        std::shared_ptr<ColumnarBlock> cb;
+        {
+            std::lock_guard<std::mutex> pool_lock(pool_mutex_);
+            if (!columnar_block_pool_.empty()) {
+                cb = std::move(columnar_block_pool_.back());
+                columnar_block_pool_.pop_back();
+            }
+        }
+        if (!cb) {
+            cb = std::make_shared<ColumnarBlock>();
+        }
+
+        ColumnarRecordArena& arena_to_copy = sealed_b->data_log_;
+        std::vector<const ColumnarRecordArena::ThreadLocalData*> tls_data_snapshot;
+        {
+            std::lock_guard<std::mutex> arena_lock(arena_to_copy.registration_mutex_);
+            for (const auto& tls_ptr : arena_to_copy.all_tls_data_) {
+                tls_data_snapshot.push_back(tls_ptr.get());
+            }
+        }
+        for (const auto* tls_data : tls_data_snapshot) {
+            for (const auto& chunk_ptr : tls_data->chunks) {
+                uint32_t max_idx = chunk_ptr->write_idx.load(std::memory_order_relaxed);
+                if (max_idx > ColumnarRecordArena::DataChunk::kRecordCapacity) {
+                    max_idx = ColumnarRecordArena::DataChunk::kRecordCapacity;
+                }
+                for (uint32_t i = 0; i < max_idx; ++i) {
+                    const auto& record_slot = chunk_ptr->records[i];
+                    if (record_slot.ready.load(std::memory_order_acquire)) {
+                        cb->Add(record_slot.record.key, record_slot.record.value, record_slot.record.type);
+                    }
+                }
+            }
+        }
+
+        if (!cb->empty()) {
+            columnar_blocks.push_back(std::move(cb));
+        } else {
+            cb->Clear();
+            std::lock_guard<std::mutex> pool_lock(pool_mutex_);
+            columnar_block_pool_.push_back(std::move(cb));
+        }
+    }
+
+    if (columnar_blocks.empty()) return;
 
     auto old_s = std::atomic_load(&immutable_state_);
     auto new_list = std::make_shared<ImmutableState::SortedBlockList>();
-    
-    // --- Compaction Path ---
+
     if (enable_compaction_) {
         std::vector<std::shared_ptr<const SortedColumnarBlock>> to_merge;
-        
-        // 1. Add blocks from the previous state to the merge set
+
         if (old_s->blocks) {
             to_merge.insert(to_merge.end(), old_s->blocks->begin(), old_s->blocks->end());
         }
 
-        // 2. Add newly sealed blocks to the merge set
-        for (const auto& b : blocks) {
-            if (b->empty()) continue;
+        for (const auto& b : columnar_blocks) {
             to_merge.push_back(std::make_shared<const SortedColumnarBlock>(b, *sorter_));
         }
-        
-        // 3. If there's anything to merge, run the compaction
+
         if (!to_merge.empty()) {
-            auto fcb = std::make_shared<ColumnarBlock>(); // The new single compacted block
+            auto fcb = std::make_shared<ColumnarBlock>();
             CompactingIterator it(std::make_unique<FlushIterator>(std::move(to_merge)));
             while (it.IsValid()) {
                 RecordRef r = it.Get();
@@ -1048,40 +1109,26 @@ inline void ColumnarMemTable::ProcessBlocks(std::vector<std::shared_ptr<Columnar
                 it.Next();
             }
 
-            // The new state will contain only the single, newly created compacted block
             if (!fcb->empty()) {
                 new_list->push_back(std::make_shared<const SortedColumnarBlock>(fcb, *sorter_));
             }
         }
-        
-        // 4. Recycle the ColumnarBlocks that were just processed
-        //    These are no longer needed because their data is now in `fcb`.
+
         {
             std::lock_guard<std::mutex> pool_lock(pool_mutex_);
-            for (auto& b : blocks) {
-                // No need to check use_count here, as their lifetime was tied to the local `to_merge`
+            for (auto& b : columnar_blocks) {
                 b->Clear();
                 columnar_block_pool_.push_back(std::move(b));
             }
         }
 
-    } 
-    // --- Non-Compaction Path ---
-    else {
+    } else {
         *new_list = *old_s->blocks;
-        for (const auto& b : blocks) {
-            if (b->empty()) {
-                b->Clear();
-                std::lock_guard<std::mutex> pool_lock(pool_mutex_);
-                columnar_block_pool_.push_back(std::move(b));
-                continue;
-            }
-            // The underlying ColumnarBlock `b` must live on as it backs the new SortedColumnarBlock.
-            // No recycling is possible here. shared_ptr handles its lifetime.
+        for (const auto& b : columnar_blocks) {
             new_list->push_back(std::make_shared<const SortedColumnarBlock>(b, *sorter_));
         }
     }
-    
+
     auto new_s = std::make_shared<ImmutableState>();
     new_s->blocks = std::move(new_list);
     auto meta_cache = std::make_shared<std::vector<ImmutableState::MetaInfo>>();
