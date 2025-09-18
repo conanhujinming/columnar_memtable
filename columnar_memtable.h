@@ -16,6 +16,7 @@
 #include <numeric>
 #include <optional>
 #include <queue>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -43,6 +44,23 @@ class ConcurrentRawArena;
 // --- Core Utility Structures ---
 struct XXHasher {
     std::size_t operator()(const std::string_view key) const noexcept { return XXH3_64bits(key.data(), key.size()); }
+};
+
+class SpinLock {
+public:
+    void lock() noexcept {
+        for (;;) {
+            if (!lock_.exchange(true, std::memory_order_acquire)) {
+                return;
+            }
+            while (lock_.load(std::memory_order_relaxed)) {
+                __builtin_ia32_pause();
+            }
+        }
+    }
+    void unlock() noexcept { lock_.store(false, std::memory_order_release); }
+private:
+    std::atomic<bool> lock_ = {false};
 };
 
 inline uint64_t load_u64_prefix(std::string_view sv) {
@@ -140,13 +158,8 @@ class ColumnarRecordArena {
     }
 
     class Iterator;
-    ColumnarRecordArena() : id_(next_id_.fetch_add(1, std::memory_order_relaxed)), size_(0) {}
-    ~ColumnarRecordArena() {
-        auto& tls_map = GetTlsMap();
-        if (tls_map.count(id_)) {
-            tls_map.erase(id_);
-        }
-    }
+    ColumnarRecordArena();
+    ~ColumnarRecordArena();
     const StoredRecord* AllocateAndAppend(std::string_view key, std::string_view value, RecordType type);
     size_t size() const { return size_.load(std::memory_order_acquire); }
     Iterator begin() const;
@@ -156,9 +169,14 @@ class ColumnarRecordArena {
     ThreadLocalData* GetTlsData();
     static std::atomic<uint64_t> next_id_;
     const uint64_t id_;
-    std::mutex registration_mutex_;
-    std::vector<std::unique_ptr<ThreadLocalData>> all_tls_data_;
     std::atomic<size_t> size_;
+
+    static constexpr size_t kMaxThreads = 256;
+    std::array<std::atomic<ThreadLocalData*>, kMaxThreads> all_tls_data_{};
+    std::atomic<uint32_t> next_tls_slot_{0};
+    
+    std::vector<ThreadLocalData*> owned_tls_data_;
+    SpinLock owner_lock_;
 };
 
 inline std::atomic<uint64_t> ColumnarRecordArena::next_id_{0};
@@ -189,7 +207,7 @@ class ConcurrentStringHashMap {
 class ColumnarRecordArena::Iterator {
    public:
     const RecordRef& operator*() const {
-        return arena_->all_tls_data_[tls_idx_]->chunks[chunk_idx_]->records[record_idx_].record;
+        return tls_snapshot_[tls_idx_]->chunks[chunk_idx_]->records[record_idx_].record;
     }
 
     Iterator& operator++() {
@@ -204,67 +222,109 @@ class ColumnarRecordArena::Iterator {
 
    private:
     friend class ColumnarRecordArena;
-    Iterator(const ColumnarRecordArena* arena, size_t tls_idx, size_t chunk_idx, size_t record_idx)
-        : arena_(arena), tls_idx_(tls_idx), chunk_idx_(chunk_idx), record_idx_(record_idx) {}
+    
+    Iterator(const ColumnarRecordArena* arena, std::vector<const ThreadLocalData*> tls_snapshot, size_t tls_idx, size_t chunk_idx, size_t record_idx)
+        : arena_(arena), tls_snapshot_(std::move(tls_snapshot)), tls_idx_(tls_idx), chunk_idx_(chunk_idx), record_idx_(record_idx) {
+        advance();
+    }
 
     void advance() {
-        while (tls_idx_ < arena_->all_tls_data_.size()) {
-            const auto& tls_data = arena_->all_tls_data_[tls_idx_];
-            while (chunk_idx_ < tls_data->chunks.size()) {
-                const auto& chunk = tls_data->chunks[chunk_idx_];
+        while (tls_idx_ < tls_snapshot_.size()) {
+            const auto* tls_data = tls_snapshot_[tls_idx_];
+            if(tls_data) {
+                while (chunk_idx_ < tls_data->chunks.size()) {
+                    const auto& chunk = tls_data->chunks[chunk_idx_];
 
-                uint32_t limit = chunk->write_idx.load(std::memory_order_relaxed);
-                if (limit > DataChunk::kRecordCapacity) {
-                    limit = DataChunk::kRecordCapacity;
-                }
-
-                while (record_idx_ < limit) {
-                    if (chunk->records[record_idx_].ready.load(std::memory_order_acquire)) {
-                        return;
+                    uint32_t limit = chunk->write_idx.load(std::memory_order_relaxed);
+                    if (limit > DataChunk::kRecordCapacity) {
+                        limit = DataChunk::kRecordCapacity;
                     }
-                    record_idx_++;
-                }
 
-                chunk_idx_++;
-                record_idx_ = 0;
+                    while (record_idx_ < limit) {
+                        if (chunk->records[record_idx_].ready.load(std::memory_order_acquire)) {
+                            return;
+                        }
+                        record_idx_++;
+                    }
+
+                    chunk_idx_++;
+                    record_idx_ = 0;
+                }
             }
             tls_idx_++;
             chunk_idx_ = 0;
             record_idx_ = 0;
         }
 
-        tls_idx_ = arena_->all_tls_data_.size();
+        tls_idx_ = tls_snapshot_.size();
         chunk_idx_ = 0;
         record_idx_ = 0;
     }
 
     const ColumnarRecordArena* arena_;
+    std::vector<const ThreadLocalData*> tls_snapshot_;
     size_t tls_idx_;
     size_t chunk_idx_;
     size_t record_idx_;
 };
 
+inline ColumnarRecordArena::ColumnarRecordArena() : id_(next_id_.fetch_add(1, std::memory_order_relaxed)), size_(0) {}
+
+inline ColumnarRecordArena::~ColumnarRecordArena() {
+    std::lock_guard<SpinLock> lock(owner_lock_);
+    for (auto* ptr : owned_tls_data_) {
+        delete ptr;
+    }
+}
+
 inline ColumnarRecordArena::Iterator ColumnarRecordArena::begin() const {
-    Iterator it(this, 0, 0, 0);
-    it.advance();
-    return it;
+    std::vector<const ThreadLocalData*> snapshot;
+    uint32_t active_threads = next_tls_slot_.load(std::memory_order_acquire);
+    if(active_threads > kMaxThreads) active_threads = kMaxThreads;
+    snapshot.reserve(active_threads);
+    for(uint32_t i = 0; i < active_threads; ++i) {
+        snapshot.push_back(all_tls_data_[i].load(std::memory_order_acquire));
+    }
+    return Iterator(this, std::move(snapshot), 0, 0, 0);
 }
 
 inline ColumnarRecordArena::Iterator ColumnarRecordArena::end() const {
-    return Iterator(this, all_tls_data_.size(), 0, 0);
+    return Iterator(this, {}, 0, 0, 0);
 }
 
 inline ColumnarRecordArena::ThreadLocalData* ColumnarRecordArena::GetTlsData() {
     auto& tls_map = GetTlsMap();
+    auto it = tls_map.find(id_);
+    if (it != tls_map.end()) {
+        return it->second;
+    }
 
-    if (tls_map.find(id_) == tls_map.end()) {
-        std::lock_guard<std::mutex> lock(registration_mutex_);
-        if (tls_map.find(id_) == tls_map.end()) {
-            all_tls_data_.push_back(std::make_unique<ThreadLocalData>());
-            tls_map[id_] = all_tls_data_.back().get();
+    thread_local uint32_t tls_slot_index = -1;
+    thread_local uint64_t last_arena_id_for_slot = -1;
+
+    if (last_arena_id_for_slot != id_) {
+        tls_slot_index = next_tls_slot_.fetch_add(1, std::memory_order_relaxed);
+        if (tls_slot_index >= kMaxThreads) {
+             next_tls_slot_.fetch_sub(1, std::memory_order_relaxed);
+             throw std::runtime_error("Exceeded kMaxThreads. Increase the compile-time constant.");
+        }
+        last_arena_id_for_slot = id_;
+    }
+    
+    ThreadLocalData* my_data = all_tls_data_[tls_slot_index].load(std::memory_order_acquire);
+    if (my_data == nullptr) {
+        auto* new_data = new ThreadLocalData();
+        if (all_tls_data_[tls_slot_index].compare_exchange_strong(my_data, new_data, std::memory_order_release, std::memory_order_acquire)) {
+            std::lock_guard<SpinLock> lock(owner_lock_);
+            owned_tls_data_.push_back(new_data);
+            my_data = new_data;
+        } else {
+            delete new_data;
         }
     }
-    return tls_map[id_];
+    
+    tls_map.emplace(id_, my_data);
+    return my_data;
 }
 
 inline const StoredRecord* ColumnarRecordArena::AllocateAndAppend(std::string_view key, std::string_view value,
@@ -955,25 +1015,41 @@ inline ColumnarMemTable::MultiGetResult ColumnarMemTable::MultiGet(const std::ve
     return results;
 }
 
+// --- MODIFICATION START: Minimized Critical Section in SealActiveBlockIfNeeded ---
 inline void ColumnarMemTable::SealActiveBlockIfNeeded() {
-    std::lock_guard<std::mutex> lock(seal_mutex_);
-    auto b = std::atomic_load(&active_block_);
-    if (b->size() < active_block_threshold_ || b->is_sealed()) {
+    auto current_b = std::atomic_load(&active_block_);
+    if (current_b->size() < active_block_threshold_ || current_b->is_sealed()) {
         return;
     }
 
-    b->Seal();
-
+    // Pre-allocate the new block outside the lock to minimize the critical section.
     auto new_b = std::make_shared<FlashActiveBlock>(active_block_threshold_);
-    std::atomic_exchange(&active_block_, new_b);
-    seal_sequence_.fetch_add(1, std::memory_order_release);
+    std::shared_ptr<FlashActiveBlock> old_b_to_seal;
 
     {
+        std::lock_guard<std::mutex> lock(seal_mutex_);
+        current_b = std::atomic_load(&active_block_);
+        if (current_b->size() < active_block_threshold_ || current_b->is_sealed()) {
+            // Another thread sealed it while we were allocating.
+            return;
+        }
+
+        current_b->Seal();
+        std::atomic_exchange(&active_block_, new_b);
+        seal_sequence_.fetch_add(1, std::memory_order_release);
+        
+        old_b_to_seal = std::move(current_b);
+    } // seal_mutex_ is released here. The critical path is now extremely short.
+
+    // Enqueue the old block outside the critical path lock.
+    {
         std::lock_guard<std::mutex> ql(queue_mutex_);
-        sealed_blocks_queue_.push_back(std::move(b));
+        sealed_blocks_queue_.push_back(std::move(old_b_to_seal));
     }
     queue_cond_.notify_one();
 }
+// --- MODIFICATION END ---
+
 
 inline void ColumnarMemTable::WaitForBackgroundWork() {
     std::unique_lock<std::mutex> lock(queue_mutex_);
@@ -1051,16 +1127,17 @@ inline void ColumnarMemTable::ProcessBlocks(std::vector<std::shared_ptr<FlashAct
         if (!cb) {
             cb = std::make_shared<ColumnarBlock>();
         }
-
-        ColumnarRecordArena& arena_to_copy = sealed_b->data_log_;
-        std::vector<const ColumnarRecordArena::ThreadLocalData*> tls_data_snapshot;
-        {
-            std::lock_guard<std::mutex> arena_lock(arena_to_copy.registration_mutex_);
-            for (const auto& tls_ptr : arena_to_copy.all_tls_data_) {
-                tls_data_snapshot.push_back(tls_ptr.get());
-            }
+        
+        auto& arena_to_copy = sealed_b->data_log_;
+        uint32_t active_threads = arena_to_copy.next_tls_slot_.load(std::memory_order_acquire);
+        if (active_threads > ColumnarRecordArena::kMaxThreads) {
+            active_threads = ColumnarRecordArena::kMaxThreads;
         }
-        for (const auto* tls_data : tls_data_snapshot) {
+
+        for (uint32_t thread_idx = 0; thread_idx < active_threads; ++thread_idx) {
+            const auto* tls_data = arena_to_copy.all_tls_data_[thread_idx].load(std::memory_order_acquire);
+            if (!tls_data) continue;
+
             for (const auto& chunk_ptr : tls_data->chunks) {
                 uint32_t max_idx = chunk_ptr->write_idx.load(std::memory_order_relaxed);
                 if (max_idx > ColumnarRecordArena::DataChunk::kRecordCapacity) {
@@ -1143,4 +1220,5 @@ inline void ColumnarMemTable::ProcessBlocks(std::vector<std::shared_ptr<FlashAct
     new_s->read_meta_cache = std::move(meta_cache);
     std::atomic_store(&immutable_state_, std::shared_ptr<const ImmutableState>(std::move(new_s)));
 }
+
 #endif  // COLUMNAR_MEMTABLE_H
