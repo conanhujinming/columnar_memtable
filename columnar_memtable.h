@@ -204,6 +204,9 @@ class ColumnarRecordArena {
     Iterator begin() const;
     Iterator end() const;
     uint32_t GetMaxThreadIdSeen() const { return max_tid_seen_.load(std::memory_order_acquire); }
+    const std::array<std::atomic<ThreadLocalData*>, ThreadIdManager::kMaxThreads>& GetAllTlsData() const {
+        return all_tls_data_;
+    }
 
    private:
     ThreadLocalData* GetTlsData();
@@ -616,7 +619,8 @@ class SortedColumnarBlock {
    public:
     class Iterator;
     static constexpr size_t kSparseIndexSampleRate = 16;
-    explicit SortedColumnarBlock(std::shared_ptr<ColumnarBlock> block, const Sorter& sorter);
+    explicit SortedColumnarBlock(std::shared_ptr<ColumnarBlock> block, const Sorter& sorter,
+                                 bool build_bloom_filter = true);
     bool MayContain(std::string_view key) const;
     std::optional<RecordRef> Get(std::string_view key) const;
     std::string_view min_key() const { return min_key_; }
@@ -633,7 +637,8 @@ class SortedColumnarBlock {
     std::unique_ptr<BloomFilter> bloom_filter_;
     std::vector<std::pair<std::string_view, size_t>> sparse_index_;
 };
-inline SortedColumnarBlock::SortedColumnarBlock(std::shared_ptr<ColumnarBlock> b, const Sorter& s)
+inline SortedColumnarBlock::SortedColumnarBlock(std::shared_ptr<ColumnarBlock> b, const Sorter& s,
+                                                bool build_bloom_filter)
     : block_data_(std::move(b)) {
     sorted_indices_ = s.Sort(*block_data_);
     if (sorted_indices_.empty()) {
@@ -644,8 +649,8 @@ inline SortedColumnarBlock::SortedColumnarBlock(std::shared_ptr<ColumnarBlock> b
     min_key_ = block_data_->keys[sorted_indices_.front()];
     max_key_ = block_data_->keys[sorted_indices_.back()];
 
-    constexpr size_t kBloomFilterThreshold = 256 * 1024; 
-    if (block_data_->size() < kBloomFilterThreshold) {
+    constexpr size_t kBloomFilterThreshold = 256 * 1024;
+    if (build_bloom_filter && block_data_->size() < kBloomFilterThreshold) {
         bloom_filter_ = std::make_unique<BloomFilter>(block_data_->size());
         for (size_t i = 0; i < block_data_->size(); ++i) {
             bloom_filter_->Add(block_data_->keys[i]);
@@ -660,7 +665,7 @@ inline SortedColumnarBlock::SortedColumnarBlock(std::shared_ptr<ColumnarBlock> b
 inline bool SortedColumnarBlock::MayContain(std::string_view key) const {
     if (empty() || key < min_key_ || key > max_key_) return false;
     if (!bloom_filter_) {
-        return true; 
+        return true;
     }
     return bloom_filter_->MayContain(key);
 }
@@ -814,20 +819,35 @@ class ColumnarMemTable : public std::enable_shared_from_this<ColumnarMemTable> {
    public:
     using GetResult = std::optional<std::string_view>;
     using MultiGetResult = std::map<std::string_view, GetResult, std::less<>>;
+
     explicit ColumnarMemTable(size_t active_block_size_bytes = 16 * 1024 * 48, bool enable_compaction = false,
-                              std::shared_ptr<Sorter> sorter = std::make_shared<ParallelRadixSorter>())
+                              std::shared_ptr<Sorter> sorter = std::make_shared<ParallelRadixSorter>(),
+                              size_t num_shards = 16)
         : active_block_threshold_(std::max((size_t)1, active_block_size_bytes / 116)),
           enable_compaction_(enable_compaction),
-          sorter_(std::move(sorter)) {
-        active_block_ = std::make_shared<FlashActiveBlock>(active_block_threshold_);
-        immutable_state_ = std::make_shared<const ImmutableState>();
+          sorter_(std::move(sorter)),
+          num_shards_(num_shards > 0 ? 1UL << (63 - __builtin_clzll(num_shards)) : 1),  // round up to power of 2
+          shard_mask_(num_shards_ - 1) {
+        for (size_t i = 0; i < num_shards_; ++i) {
+            shards_.push_back(std::make_unique<Shard>(active_block_threshold_));
+        }
         background_thread_ = std::thread(&ColumnarMemTable::BackgroundWorkerLoop, this);
     }
-    ~ColumnarMemTable();
+
+    ~ColumnarMemTable() {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            stop_background_thread_ = true;
+        }
+        queue_cond_.notify_one();
+        if (background_thread_.joinable()) background_thread_.join();
+    }
+
     ColumnarMemTable(const ColumnarMemTable&) = delete;
     ColumnarMemTable& operator=(const ColumnarMemTable&) = delete;
-    void Put(std::string_view key, std::string_view value);
-    void Delete(std::string_view key);
+
+    void Put(std::string_view key, std::string_view value) { Insert(key, value, RecordType::Put); }
+    void Delete(std::string_view key) { Insert(key, "", RecordType::Delete); }
     GetResult Get(std::string_view key) const;
     MultiGetResult MultiGet(const std::vector<std::string_view>& keys) const;
     void PutBatch(const std::vector<std::pair<std::string_view, std::string_view>>& batch);
@@ -835,120 +855,94 @@ class ColumnarMemTable : public std::enable_shared_from_this<ColumnarMemTable> {
     std::unique_ptr<CompactingIterator> NewCompactingIterator();
 
    private:
-    // --- FIX START: Add sealed_blocks to ImmutableState for immediate visibility ---
+    // --- Core Shard Structures ---
     struct ImmutableState {
         using SortedBlockList = std::vector<std::shared_ptr<const SortedColumnarBlock>>;
         using SealedBlockList = std::vector<std::shared_ptr<FlashActiveBlock>>;
-        using MetaInfo = std::tuple<std::string_view, std::string_view, std::shared_ptr<const SortedColumnarBlock>>;
 
         std::shared_ptr<const SealedBlockList> sealed_blocks;
         std::shared_ptr<const SortedBlockList> blocks;
-        std::shared_ptr<const std::vector<MetaInfo>> read_meta_cache;
 
         ImmutableState()
             : sealed_blocks(std::make_shared<const SealedBlockList>()),
-              blocks(std::make_shared<const SortedBlockList>()),
-              read_meta_cache(std::make_shared<const std::vector<MetaInfo>>()) {}
+              blocks(std::make_shared<const SortedBlockList>()) {}
     };
-    // --- FIX END ---
+
+    struct alignas(64) Shard {
+        std::shared_ptr<FlashActiveBlock> active_block_;
+        std::shared_ptr<const ImmutableState> immutable_state_;
+        std::atomic<uint64_t> version_{0};
+        SpinLock seal_mutex_;
+
+        Shard(size_t active_block_threshold) {
+            active_block_ = std::make_shared<FlashActiveBlock>(active_block_threshold);
+            immutable_state_ = std::make_shared<const ImmutableState>();
+        }
+    };
 
     struct BackgroundWorkItem {
-        std::shared_ptr<FlashActiveBlock> block;  // Can be nullptr for a barrier
+        std::shared_ptr<FlashActiveBlock> block;
         std::unique_ptr<std::promise<void>> promise;
+        size_t shard_idx;  // Identify the source shard
     };
-    std::unique_ptr<FlushIterator> NewRawFlushIterator();
-    std::vector<std::unique_ptr<ColumnarBlock>> columnar_block_pool_;
-    std::mutex pool_mutex_;
-    std::shared_ptr<ColumnarBlock> GetPooledColumnarBlock();
-    void Insert(std::string_view key, std::string_view value, RecordType type);
-    void SealActiveBlockIfNeeded();
-    void BackgroundWorkerLoop();
-    void ProcessBlocks(std::vector<BackgroundWorkItem> work_items);
 
-    // --- FIX START: TLS functions now safely return shared_ptr ---
-    std::shared_ptr<FlashActiveBlock> GetActiveBlockForThread(bool force_refresh = false) const;
-    std::shared_ptr<const ImmutableState> GetImmutableStateForThread() const;
-    // --- FIX END ---
-
-    size_t active_block_threshold_;
+    // --- Member Variables ---
+    const size_t active_block_threshold_;
     const bool enable_compaction_;
     std::shared_ptr<Sorter> sorter_;
-    std::shared_ptr<FlashActiveBlock> active_block_;
-    std::shared_ptr<const ImmutableState> immutable_state_;
-    alignas(64) std::atomic<uint64_t> seal_sequence_{0};
-    SpinLock seal_mutex_;
+    const size_t num_shards_;
+    const size_t shard_mask_;
+    std::vector<std::unique_ptr<Shard>> shards_;
+    XXHasher hasher_;
+
+    // Shared background processing components
+    std::vector<std::unique_ptr<ColumnarBlock>> columnar_block_pool_;
+    std::mutex pool_mutex_;
     std::vector<BackgroundWorkItem> sealed_blocks_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cond_;
     std::thread background_thread_;
     std::atomic<bool> stop_background_thread_{false};
-    std::atomic<bool> background_thread_processing_{false};
+
+    // --- Methods ---
+    size_t GetShardIdx(std::string_view key) const { return hasher_(key) & shard_mask_; }
+    void Insert(std::string_view key, std::string_view value, RecordType type);
+    void SealActiveBlockIfNeeded(size_t shard_idx);
+    void BackgroundWorkerLoop();
+    void ProcessBlocksForShard(size_t shard_idx, const std::vector<std::shared_ptr<FlashActiveBlock>>& sealed_blocks);
+    std::shared_ptr<ColumnarBlock> GetPooledColumnarBlock();
+
+    // TLS Caching for performance
+    std::shared_ptr<FlashActiveBlock> GetActiveBlockForThread(size_t shard_idx, bool force_refresh = false) const;
+    std::shared_ptr<const ImmutableState> GetImmutableStateForThread(size_t shard_idx,
+                                                                     bool force_refresh = false) const;
 };
 
-inline ColumnarMemTable::~ColumnarMemTable() {
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        stop_background_thread_ = true;
-    }
-    queue_cond_.notify_one();
-    if (background_thread_.joinable()) background_thread_.join();
-}
-
-inline std::shared_ptr<ColumnarBlock> ColumnarMemTable::GetPooledColumnarBlock() {
-    std::weak_ptr<ColumnarMemTable> weak_self = shared_from_this();
-
-    auto recycler_deleter = [weak_self](ColumnarBlock* ptr) {
-        if (auto shared_self = weak_self.lock()) {
-            ptr->Clear();
-            {
-                std::lock_guard<std::mutex> lock(shared_self->pool_mutex_);
-                shared_self->columnar_block_pool_.emplace_back(ptr);
-            }
-        } else {
-            delete ptr;
-        }
-    };
-
-    std::lock_guard<std::mutex> lock(pool_mutex_);
-    if (!columnar_block_pool_.empty()) {
-        std::unique_ptr<ColumnarBlock> block_ptr = std::move(columnar_block_pool_.back());
-        columnar_block_pool_.pop_back();
-        return std::shared_ptr<ColumnarBlock>(block_ptr.release(), recycler_deleter);
-    }
-    return std::shared_ptr<ColumnarBlock>(new ColumnarBlock(), recycler_deleter);
-}
+// --- Implementation ---
 
 inline void ColumnarMemTable::Insert(std::string_view k, std::string_view v, RecordType t) {
-    // --- FIX START: Use shared_ptr from TLS cache to ensure lifetime ---
-    auto current_block = GetActiveBlockForThread();
+    const size_t shard_idx = GetShardIdx(k);
+
+    auto current_block = GetActiveBlockForThread(shard_idx);
     while (!current_block->TryAdd(k, v, t)) {
-        current_block = GetActiveBlockForThread(true);
+        current_block = GetActiveBlockForThread(shard_idx, true);
     }
-    // --- FIX END ---
+
     if (current_block->size() >= active_block_threshold_) {
-        SealActiveBlockIfNeeded();
+        SealActiveBlockIfNeeded(shard_idx);
     }
 }
 
-inline void ColumnarMemTable::Put(std::string_view k, std::string_view v) { Insert(k, v, RecordType::Put); }
-inline void ColumnarMemTable::Delete(std::string_view k) { Insert(k, "", RecordType::Delete); }
-inline void ColumnarMemTable::PutBatch(const std::vector<std::pair<std::string_view, std::string_view>>& batch) {
-    for (const auto& [k, v] : batch) Insert(k, v, RecordType::Put);
-}
-
-// --- FIX START: Get now uses shared_ptrs and checks sealed blocks ---
 inline ColumnarMemTable::GetResult ColumnarMemTable::Get(std::string_view key) const {
-    // Get thread-local shared_ptrs once. This is safe and fast.
-    auto active_block = GetActiveBlockForThread();
-    auto s = GetImmutableStateForThread();
+    const size_t shard_idx = GetShardIdx(key);
 
-    // 1. Check the active block.
+    auto active_block = GetActiveBlockForThread(shard_idx);
     if (auto r = active_block->Get(key)) {
         return (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt;
     }
 
-    // 2. Check sealed blocks (newest to oldest).
-    if (s && s->sealed_blocks) {
+    auto s = GetImmutableStateForThread(shard_idx);
+    if (s->sealed_blocks) {
         for (auto it = s->sealed_blocks->rbegin(); it != s->sealed_blocks->rend(); ++it) {
             if (auto r = (*it)->Get(key)) {
                 return (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt;
@@ -956,196 +950,115 @@ inline ColumnarMemTable::GetResult ColumnarMemTable::Get(std::string_view key) c
         }
     }
 
-    // 3. Search immutable sorted blocks (newest to oldest).
-    if (s && s->read_meta_cache) {
-        for (auto it = s->read_meta_cache->rbegin(); it != s->read_meta_cache->rend(); ++it) {
-            const auto& [min_k, max_k, ptr] = *it;
-            if (key >= min_k && key <= max_k) {
-                if (auto r = ptr->Get(key)) return (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt;
+    if (s->blocks) {
+        for (auto it = s->blocks->rbegin(); it != s->blocks->rend(); ++it) {
+            if (auto r = (*it)->Get(key)) {
+                return (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt;
             }
         }
     }
     return std::nullopt;
 }
-// --- FIX END ---
 
-// --- FIX START: MultiGet now uses shared_ptrs and checks sealed blocks ---
+inline void ColumnarMemTable::PutBatch(const std::vector<std::pair<std::string_view, std::string_view>>& batch) {
+    for (const auto& [k, v] : batch) Insert(k, v, RecordType::Put);
+}
+
 inline ColumnarMemTable::MultiGetResult ColumnarMemTable::MultiGet(const std::vector<std::string_view>& keys) const {
     MultiGetResult results;
-    if (keys.empty()) return results;
-
-    std::vector<std::string_view> remaining_keys;
-    remaining_keys.reserve(keys.size());
-
-    // Get thread-local shared_ptrs once for the entire batch operation.
-    auto active_block = GetActiveBlockForThread();
-    auto global_state = GetImmutableStateForThread();
-
-    // 1. Check active block
-    for (const auto& k : keys) {
-        if (auto r = active_block->Get(k)) {
-            results.emplace(k, (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt);
-        } else {
-            remaining_keys.push_back(k);
-        }
+    for (const auto& key : keys) {
+        results.emplace(key, Get(key));
     }
-    if (remaining_keys.empty()) return results;
-
-    // 2. Check sealed blocks (newest to oldest)
-    if (global_state && global_state->sealed_blocks) {
-        for (auto it = global_state->sealed_blocks->rbegin(); it != global_state->sealed_blocks->rend(); ++it) {
-            if (remaining_keys.empty()) break;
-            auto& sealed_block = *it;
-            // Erase-remove idiom on remaining keys
-            remaining_keys.erase(std::remove_if(remaining_keys.begin(), remaining_keys.end(),
-                                                [&](std::string_view k) {
-                                                    if (auto r = sealed_block->Get(k)) {
-                                                        results.emplace(k, (r->type == RecordType::Put)
-                                                                               ? GetResult(r->value)
-                                                                               : std::nullopt);
-                                                        return true;  // remove from remaining_keys
-                                                    }
-                                                    return false;
-                                                }),
-                                 remaining_keys.end());
-        }
-    }
-    if (remaining_keys.empty()) return results;
-
-    // 3. Check sorted immutable blocks
-    if (global_state && global_state->read_meta_cache) {
-        std::sort(remaining_keys.begin(), remaining_keys.end());
-        for (auto block_it = global_state->read_meta_cache->rbegin(); block_it != global_state->read_meta_cache->rend();
-             ++block_it) {
-            if (remaining_keys.empty()) break;
-            const auto& [min_k, max_k, block_ptr] = *block_it;
-
-            remaining_keys.erase(std::remove_if(remaining_keys.begin(), remaining_keys.end(),
-                                                [&](std::string_view k) {
-                                                    if (k >= min_k && k <= max_k) {
-                                                        if (auto r = block_ptr->Get(k)) {
-                                                            results.emplace(k, (r->type == RecordType::Put)
-                                                                                   ? GetResult(r->value)
-                                                                                   : std::nullopt);
-                                                            return true;
-                                                        }
-                                                    }
-                                                    return false;
-                                                }),
-                                 remaining_keys.end());
-        }
-    }
-
-    // Fill in remaining keys as not found
-    for (const auto& k : remaining_keys) {
-        results.emplace(k, std::nullopt);
-    }
-    // Ensure original keys are all present
-    for (const auto& k : keys) {
-        results.try_emplace(k, std::nullopt);
-    }
-
     return results;
 }
-// --- FIX END ---
 
-// --- FIX START: SealActiveBlockIfNeeded now atomically updates ImmutableState ---
-inline void ColumnarMemTable::SealActiveBlockIfNeeded() {
-    auto current_b_sp = std::atomic_load(&active_block_);
-    if (current_b_sp->size() < active_block_threshold_ || current_b_sp->is_sealed()) {
-        return;
-    }
+inline void ColumnarMemTable::SealActiveBlockIfNeeded(size_t shard_idx) {
+    auto& shard = *shards_[shard_idx];
+    auto current_b_sp = std::atomic_load(&shard.active_block_);
+    if (current_b_sp->size() < active_block_threshold_ || current_b_sp->is_sealed()) return;
 
     std::shared_ptr<FlashActiveBlock> sealed_block;
     {
-        std::lock_guard<SpinLock> lock(seal_mutex_);
-        current_b_sp = std::atomic_load(&active_block_);  // Re-check under lock
-        if (current_b_sp->size() < active_block_threshold_ || current_b_sp->is_sealed()) {
-            return;
-        }
+        std::lock_guard<SpinLock> lock(shard.seal_mutex_);
+        current_b_sp = std::atomic_load(&shard.active_block_);
+        if (current_b_sp->size() < active_block_threshold_ || current_b_sp->is_sealed()) return;
 
         current_b_sp->Seal();
         sealed_block = current_b_sp;
 
-        // Create new active block
         auto new_active_block = std::make_shared<FlashActiveBlock>(active_block_threshold_);
 
-        // Create new immutable state with the newly sealed block
-        auto old_s = std::atomic_load(&immutable_state_);
+        auto old_s = std::atomic_load(&shard.immutable_state_);
         auto new_s = std::make_shared<ImmutableState>();
         new_s->blocks = old_s->blocks;
-        new_s->read_meta_cache = old_s->read_meta_cache;
         auto new_sealed_list = std::make_shared<ImmutableState::SealedBlockList>(*old_s->sealed_blocks);
         new_sealed_list->push_back(sealed_block);
         new_s->sealed_blocks = new_sealed_list;
 
-        // Atomically publish new active block and new state
-        std::atomic_exchange(&active_block_, new_active_block);
-        std::atomic_store(&immutable_state_, std::shared_ptr<const ImmutableState>(new_s));
-
-        seal_sequence_.fetch_add(1, std::memory_order_release);
+        std::atomic_exchange(&shard.active_block_, new_active_block);
+        std::atomic_store(&shard.immutable_state_, std::shared_ptr<const ImmutableState>(new_s));
+        shard.version_.fetch_add(1, std::memory_order_release);
     }
 
-    // Enqueue the sealed block for background processing AFTER state is updated
     {
         std::lock_guard<std::mutex> ql(queue_mutex_);
-        sealed_blocks_queue_.push_back({std::move(sealed_block), nullptr});
+        sealed_blocks_queue_.push_back({std::move(sealed_block), nullptr, shard_idx});
     }
     queue_cond_.notify_one();
 }
-// --- FIX END ---
 
-inline void ColumnarMemTable::WaitForBackgroundWork() { NewRawFlushIterator(); }
-
-inline std::unique_ptr<FlushIterator> ColumnarMemTable::NewRawFlushIterator() {
-    std::shared_ptr<FlashActiveBlock> ab_to_seal;
-    {
-        std::lock_guard<SpinLock> lock(seal_mutex_);
-        auto ab = std::atomic_load(&active_block_);
-        if (ab->size() > 0 && !ab->is_sealed()) {
-            ab->Seal();
-            auto new_b = std::make_shared<FlashActiveBlock>(active_block_threshold_);
-
-            // Create new immutable state with the newly sealed block
-            auto old_s = std::atomic_load(&immutable_state_);
-            auto new_s = std::make_shared<ImmutableState>();
-            new_s->blocks = old_s->blocks;
-            new_s->read_meta_cache = old_s->read_meta_cache;
-            auto new_sealed_list = std::make_shared<ImmutableState::SealedBlockList>(*old_s->sealed_blocks);
-            new_sealed_list->push_back(ab);
-            new_s->sealed_blocks = new_sealed_list;
-
-            std::atomic_exchange(&active_block_, new_b);
-            std::atomic_store(&immutable_state_, std::shared_ptr<const ImmutableState>(new_s));
-
-            seal_sequence_.fetch_add(1, std::memory_order_release);
-            ab_to_seal = std::move(ab);
-        }
-    }
-
+inline void ColumnarMemTable::WaitForBackgroundWork() {
     auto promise = std::make_unique<std::promise<void>>();
     auto future = promise->get_future();
 
     {
-        std::lock_guard<std::mutex> ql(queue_mutex_);
-        if (ab_to_seal) {
-            sealed_blocks_queue_.push_back({std::move(ab_to_seal), nullptr});
+        std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+
+        for (size_t i = 0; i < num_shards_; ++i) {
+            auto& shard = *shards_[i];
+            std::lock_guard<SpinLock> seal_lock(shard.seal_mutex_);
+
+            auto ab = std::atomic_load(&shard.active_block_);
+            if (ab->size() > 0 && !ab->is_sealed()) {
+                ab->Seal();
+                auto new_b = std::make_shared<FlashActiveBlock>(active_block_threshold_);
+
+                auto old_s = std::atomic_load(&shard.immutable_state_);
+                auto new_s = std::make_shared<ImmutableState>();
+                new_s->blocks = old_s->blocks;
+                auto new_sealed_list = std::make_shared<ImmutableState::SealedBlockList>(*old_s->sealed_blocks);
+                new_sealed_list->push_back(ab);
+                new_s->sealed_blocks = new_sealed_list;
+
+                std::atomic_exchange(&shard.active_block_, new_b);
+                std::atomic_store(&shard.immutable_state_, std::shared_ptr<const ImmutableState>(new_s));
+                shard.version_.fetch_add(1, std::memory_order_release);
+
+                sealed_blocks_queue_.push_back({std::move(ab), nullptr, i});
+            }
         }
-        sealed_blocks_queue_.push_back({nullptr, std::move(promise)});
+
+        sealed_blocks_queue_.push_back({nullptr, std::move(promise), 0});
     }
+
     queue_cond_.notify_one();
-
     future.wait();
-
-    auto s = std::atomic_load(&immutable_state_);
-    if (s && s->blocks) {
-        return std::make_unique<FlushIterator>(*s->blocks);
-    }
-    return std::make_unique<FlushIterator>(std::vector<std::shared_ptr<const SortedColumnarBlock>>{});
 }
 
 inline std::unique_ptr<CompactingIterator> ColumnarMemTable::NewCompactingIterator() {
-    return std::make_unique<CompactingIterator>(NewRawFlushIterator());
+    WaitForBackgroundWork();
+
+    std::vector<std::shared_ptr<const SortedColumnarBlock>> all_blocks;
+    for(const auto& shard_ptr : shards_) {
+        auto s = std::atomic_load(&shard_ptr->immutable_state_);
+        if (s->blocks && !s->blocks->empty()) {
+            all_blocks.insert(all_blocks.end(), s->blocks->begin(), s->blocks->end());
+        }
+    }
+
+    auto flush_iterator = std::make_unique<FlushIterator>(all_blocks);
+
+    return std::make_unique<CompactingIterator>(std::move(flush_iterator));
 }
 
 inline void ColumnarMemTable::BackgroundWorkerLoop() {
@@ -1156,155 +1069,173 @@ inline void ColumnarMemTable::BackgroundWorkerLoop() {
             queue_cond_.wait(lock, [this] { return !sealed_blocks_queue_.empty() || stop_background_thread_; });
             if (stop_background_thread_ && sealed_blocks_queue_.empty()) return;
             work_items.swap(sealed_blocks_queue_);
-            background_thread_processing_.store(true, std::memory_order_release);
         }
 
-        try {
-            ProcessBlocks(std::move(work_items));
-        } catch (const std::exception& e) {
-            std::cerr << "!!! Exception in background thread: " << e.what() << std::endl;
-        } catch (...) {
-            std::cerr << "!!! Unknown exception in background thread." << std::endl;
+        std::map<size_t, std::vector<std::shared_ptr<FlashActiveBlock>>> work_by_shard;
+        std::vector<std::unique_ptr<std::promise<void>>> promises;
+
+        for (auto& item : work_items) {
+            if (item.block) {
+                work_by_shard[item.shard_idx].push_back(std::move(item.block));
+            }
+            if (item.promise) {
+                promises.push_back(std::move(item.promise));
+            }
         }
 
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            background_thread_processing_.store(false, std::memory_order_release);
+        for (auto const& [shard_idx, blocks] : work_by_shard) {
+            try {
+                ProcessBlocksForShard(shard_idx, blocks);
+            } catch (const std::exception& e) {
+                std::cerr << "!!! Exception in background thread for shard " << shard_idx << ": " << e.what()
+                          << std::endl;
+            }
         }
-        queue_cond_.notify_all();
+
+        for (auto& p : promises) {
+            p->set_value();
+        }
     }
 }
 
-// --- FIX START: TLS functions now safely manage and return shared_ptr ---
-inline std::shared_ptr<FlashActiveBlock> ColumnarMemTable::GetActiveBlockForThread(bool force_refresh) const {
-    thread_local std::shared_ptr<FlashActiveBlock> active_block_cache;
-    thread_local uint64_t last_seen_seal_sequence = -1;
+inline void ColumnarMemTable::ProcessBlocksForShard(
+    size_t shard_idx, const std::vector<std::shared_ptr<FlashActiveBlock>>& sealed_blocks) {
+    if (sealed_blocks.empty()) return;
 
-    uint64_t current_sequence = seal_sequence_.load(std::memory_order_acquire);
-
-    if (force_refresh || active_block_cache == nullptr || last_seen_seal_sequence != current_sequence) {
-        active_block_cache = std::atomic_load(&active_block_);
-        last_seen_seal_sequence = current_sequence;
-    }
-    return active_block_cache;
-}
-
-inline std::shared_ptr<const ColumnarMemTable::ImmutableState> ColumnarMemTable::GetImmutableStateForThread() const {
-    thread_local std::shared_ptr<const ImmutableState> immutable_state_cache;
-    thread_local uint64_t last_seen_seal_sequence = -1;
-
-    uint64_t current_sequence = seal_sequence_.load(std::memory_order_acquire);
-
-    if (immutable_state_cache == nullptr || last_seen_seal_sequence != current_sequence) {
-        immutable_state_cache = std::atomic_load(&immutable_state_);
-        last_seen_seal_sequence = current_sequence;
-    }
-    return immutable_state_cache;
-}
-// --- FIX END ---
-
-// --- FIX START: ProcessBlocks now updates both sealed and sorted lists ---
-inline void ColumnarMemTable::ProcessBlocks(std::vector<BackgroundWorkItem> work_items) {
-    if (work_items.empty()) return;
-
-    std::vector<std::shared_ptr<FlashActiveBlock>> processed_blocks;
-    std::vector<std::unique_ptr<std::promise<void>>> promises;
-    for (auto& item : work_items) {
-        if (item.block) {
-            processed_blocks.push_back(std::move(item.block));
-        }
-        if (item.promise) {
-            promises.push_back(std::move(item.promise));
-        }
-    }
-
-    if (!processed_blocks.empty()) {
-        std::vector<std::shared_ptr<const SortedColumnarBlock>> new_sorted_blocks;
-        new_sorted_blocks.reserve(processed_blocks.size());
-        for (const auto& sealed_b : processed_blocks) {
-            auto cb = GetPooledColumnarBlock();
-            // ... (The block conversion logic is unchanged and correct)
-            auto& arena_to_copy = sealed_b->data_log_;
-            uint32_t active_threads = arena_to_copy.GetMaxThreadIdSeen() + 1;
-            if (active_threads > ThreadIdManager::kMaxThreads) active_threads = ThreadIdManager::kMaxThreads;
-            for (uint32_t thread_idx = 0; thread_idx < active_threads; ++thread_idx) {
-                const auto* tls_data = arena_to_copy.all_tls_data_[thread_idx].load(std::memory_order_acquire);
-                if (!tls_data) continue;
-                for (const auto& chunk_ptr : tls_data->chunks) {
-                    uint32_t max_idx = chunk_ptr->write_idx.load(std::memory_order_relaxed);
-                    if (max_idx > ColumnarRecordArena::DataChunk::kRecordCapacity)
-                        max_idx = ColumnarRecordArena::DataChunk::kRecordCapacity;
-                    for (uint32_t i = 0; i < max_idx; ++i) {
-                        const auto& record_slot = chunk_ptr->records[i];
-                        if (record_slot.ready.load(std::memory_order_acquire)) {
-                            cb->Add(record_slot.record.key, record_slot.record.value, record_slot.record.type);
-                        }
+    std::vector<std::shared_ptr<const SortedColumnarBlock>> new_sorted_blocks;
+    new_sorted_blocks.reserve(sealed_blocks.size());
+    for (const auto& sealed_b : sealed_blocks) {
+        auto cb = GetPooledColumnarBlock();
+        const auto& arena_to_copy = sealed_b->data_log_;
+        uint32_t active_threads = arena_to_copy.GetMaxThreadIdSeen() + 1;
+        if (active_threads > ThreadIdManager::kMaxThreads) active_threads = ThreadIdManager::kMaxThreads;
+        for (uint32_t thread_idx = 0; thread_idx < active_threads; ++thread_idx) {
+            const auto* tls_data = arena_to_copy.GetAllTlsData()[thread_idx].load(std::memory_order_acquire);
+            if (!tls_data) continue;
+            for (const auto& chunk_ptr : tls_data->chunks) {
+                uint32_t max_idx = chunk_ptr->write_idx.load(std::memory_order_relaxed);
+                if (max_idx > ColumnarRecordArena::DataChunk::kRecordCapacity)
+                    max_idx = ColumnarRecordArena::DataChunk::kRecordCapacity;
+                for (uint32_t i = 0; i < max_idx; ++i) {
+                    const auto& record_slot = chunk_ptr->records[i];
+                    if (record_slot.ready.load(std::memory_order_acquire)) {
+                        cb->Add(record_slot.record.key, record_slot.record.value, record_slot.record.type);
                     }
                 }
             }
-            if (!cb->empty()) {
-                new_sorted_blocks.push_back(std::make_shared<const SortedColumnarBlock>(std::move(cb), *sorter_));
+        }
+        if (!cb->empty()) {
+            new_sorted_blocks.push_back(
+                std::make_shared<const SortedColumnarBlock>(std::move(cb), *sorter_, !enable_compaction_));
+        }
+    }
+
+    auto& shard = *shards_[shard_idx];
+    std::lock_guard<SpinLock> lock(shard.seal_mutex_);
+
+    auto old_s = std::atomic_load(&shard.immutable_state_);
+    auto new_s = std::make_shared<ImmutableState>();
+
+    auto new_sorted_list = std::make_shared<ImmutableState::SortedBlockList>();
+    if (enable_compaction_) {
+        std::vector<std::shared_ptr<const SortedColumnarBlock>> to_merge;
+        if (old_s->blocks) to_merge.insert(to_merge.end(), old_s->blocks->begin(), old_s->blocks->end());
+        to_merge.insert(to_merge.end(), new_sorted_blocks.begin(), new_sorted_blocks.end());
+        if (!to_merge.empty()) {
+            auto compacted_block = GetPooledColumnarBlock();
+            CompactingIterator it(std::make_unique<FlushIterator>(to_merge));
+            while (it.IsValid()) {
+                RecordRef r = it.Get();
+                compacted_block->Add(r.key, r.value, r.type);
+                it.Next();
+            }
+            if (!compacted_block->empty()) {
+                new_sorted_list->push_back(
+                    std::make_shared<const SortedColumnarBlock>(std::move(compacted_block), *sorter_, false));
             }
         }
+    } else {
+        if (old_s->blocks) *new_sorted_list = *old_s->blocks;
+        new_sorted_list->insert(new_sorted_list->end(), new_sorted_blocks.begin(), new_sorted_blocks.end());
+    }
+    new_s->blocks = std::move(new_sorted_list);
 
-        // This lock synchronizes state updates with the SealActiveBlockIfNeeded function
-        std::lock_guard<SpinLock> lock(seal_mutex_);
+    auto new_sealed_list = std::make_shared<ImmutableState::SealedBlockList>();
+    if (old_s->sealed_blocks) {
+        for (const auto& b : *old_s->sealed_blocks) {
+            bool was_processed = false;
+            for (const auto& pb : sealed_blocks)
+                if (b == pb) {
+                    was_processed = true;
+                    break;
+                }
+            if (!was_processed) new_sealed_list->push_back(b);
+        }
+    }
+    new_s->sealed_blocks = std::move(new_sealed_list);
 
-        auto old_s = std::atomic_load(&immutable_state_);
-        auto new_s = std::make_shared<ImmutableState>();
+    std::atomic_store(&shard.immutable_state_, std::shared_ptr<const ImmutableState>(new_s));
+}
 
-        // 1. Create the new sorted block list
-        auto new_sorted_list = std::make_shared<ImmutableState::SortedBlockList>();
-        // ... (Compaction/Merging logic is unchanged and correct)
-        if (enable_compaction_) {
-            // ...
+inline std::shared_ptr<ColumnarBlock> ColumnarMemTable::GetPooledColumnarBlock() {
+    std::weak_ptr<ColumnarMemTable> weak_self = shared_from_this();
+    auto recycler_deleter = [weak_self](ColumnarBlock* ptr) {
+        if (auto shared_self = weak_self.lock()) {
+            ptr->Clear();
+            std::lock_guard<std::mutex> lock(shared_self->pool_mutex_);
+            shared_self->columnar_block_pool_.emplace_back(ptr);
         } else {
-            if (old_s->blocks) {
-                *new_sorted_list = *old_s->blocks;
-            }
-            new_sorted_list->insert(new_sorted_list->end(), new_sorted_blocks.begin(), new_sorted_blocks.end());
+            delete ptr;
         }
-        new_s->blocks = std::move(new_sorted_list);
-
-        // 2. Create the new sealed block list, removing the blocks we just processed.
-        auto new_sealed_list = std::make_shared<ImmutableState::SealedBlockList>();
-        if (old_s->sealed_blocks) {
-            for (const auto& sealed_b : *old_s->sealed_blocks) {
-                bool was_processed = false;
-                for (const auto& processed_b : processed_blocks) {
-                    if (sealed_b == processed_b) {
-                        was_processed = true;
-                        break;
-                    }
-                }
-                if (!was_processed) {
-                    new_sealed_list->push_back(sealed_b);
-                }
-            }
-        }
-        new_s->sealed_blocks = std::move(new_sealed_list);
-
-        // 3. Rebuild meta cache
-        auto meta_cache = std::make_shared<std::vector<ImmutableState::MetaInfo>>();
-        if (new_s->blocks) {
-            meta_cache->reserve(new_s->blocks->size());
-            for (const auto& b : *new_s->blocks) {
-                if (b && !b->empty()) {
-                    meta_cache->emplace_back(b->min_key(), b->max_key(), b);
-                }
-            }
-        }
-        new_s->read_meta_cache = std::move(meta_cache);
-
-        // 4. Atomically publish the new state
-        std::atomic_store(&immutable_state_, std::shared_ptr<const ImmutableState>(std::move(new_s)));
+    };
+    std::lock_guard<std::mutex> lock(pool_mutex_);
+    if (!columnar_block_pool_.empty()) {
+        std::unique_ptr<ColumnarBlock> block_ptr = std::move(columnar_block_pool_.back());
+        columnar_block_pool_.pop_back();
+        return std::shared_ptr<ColumnarBlock>(block_ptr.release(), recycler_deleter);
     }
-
-    // Fulfill any promises AFTER the state has been updated.
-    for (auto& promise : promises) {
-        promise->set_value();
-    }
+    return std::shared_ptr<ColumnarBlock>(new ColumnarBlock(), recycler_deleter);
 }
-// --- FIX END ---
+
+inline std::shared_ptr<FlashActiveBlock> ColumnarMemTable::GetActiveBlockForThread(size_t shard_idx,
+                                                                                   bool force_refresh) const {
+    thread_local std::vector<std::shared_ptr<FlashActiveBlock>> active_block_cache;
+    thread_local std::vector<uint64_t> last_seen_version;
+
+    if (active_block_cache.size() != num_shards_) {
+        active_block_cache.resize(num_shards_);
+        last_seen_version.resize(num_shards_, -1);
+    }
+
+    const auto& shard = *shards_[shard_idx];
+    uint64_t current_version = shard.version_.load(std::memory_order_acquire);
+
+    if (force_refresh || active_block_cache[shard_idx] == nullptr || last_seen_version[shard_idx] != current_version) {
+        active_block_cache[shard_idx] = std::atomic_load(&shard.active_block_);
+        last_seen_version[shard_idx] = current_version;
+    }
+    return active_block_cache[shard_idx];
+}
+
+inline std::shared_ptr<const ColumnarMemTable::ImmutableState> ColumnarMemTable::GetImmutableStateForThread(
+    size_t shard_idx, bool force_refresh) const {
+    thread_local std::vector<std::shared_ptr<const ImmutableState>> immutable_state_cache;
+    thread_local std::vector<uint64_t> last_seen_version;
+
+    if (immutable_state_cache.size() != num_shards_) {
+        immutable_state_cache.resize(num_shards_);
+        last_seen_version.resize(num_shards_, -1);
+    }
+
+    const auto& shard = *shards_[shard_idx];
+    uint64_t current_version = shard.version_.load(std::memory_order_acquire);
+
+    if (force_refresh || immutable_state_cache[shard_idx] == nullptr ||
+        last_seen_version[shard_idx] != current_version) {
+        immutable_state_cache[shard_idx] = std::atomic_load(&shard.immutable_state_);
+        last_seen_version[shard_idx] = current_version;
+    }
+    return immutable_state_cache[shard_idx];
+}
 
 #endif  // COLUMNAR_MEMTABLE_H
