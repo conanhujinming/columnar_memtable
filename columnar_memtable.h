@@ -151,7 +151,6 @@ class ThreadIdManager {
             } else {
                 id = next_id_.fetch_add(1, std::memory_order_relaxed);
                 if (id >= kMaxThreads) {
-                    // Roll back and throw.
                     next_id_.fetch_sub(1, std::memory_order_relaxed);
                     throw std::runtime_error("Exceeded kMaxThreads. Increase the compile-time constant.");
                 }
@@ -200,6 +199,8 @@ class ColumnarRecordArena {
     ColumnarRecordArena();
     ~ColumnarRecordArena();
     const StoredRecord* AllocateAndAppend(std::string_view key, std::string_view value, RecordType type);
+    std::vector<const StoredRecord*> AllocateAndAppendBatch(
+        const std::vector<std::pair<std::string_view, std::string_view>>& batch, RecordType type);
     size_t size() const { return size_.load(std::memory_order_acquire); }
     Iterator begin() const;
     Iterator end() const;
@@ -313,7 +314,6 @@ inline ColumnarRecordArena::Iterator ColumnarRecordArena::begin() const {
 inline ColumnarRecordArena::Iterator ColumnarRecordArena::end() const { return Iterator({}, 0, 0, 0); }
 inline ColumnarRecordArena::ThreadLocalData* ColumnarRecordArena::GetTlsData() {
     uint32_t tid = ThreadIdManager::GetId();
-    // Update max_tid_seen_ if our tid is higher
     uint32_t current_max = max_tid_seen_.load(std::memory_order_relaxed);
     while (tid > current_max) {
         if (max_tid_seen_.compare_exchange_weak(current_max, tid, std::memory_order_release,
@@ -345,11 +345,15 @@ inline const StoredRecord* ColumnarRecordArena::AllocateAndAppend(std::string_vi
     size_t required_size = key.size() + value.size();
     uint32_t record_idx = chunk->write_idx.fetch_add(1, std::memory_order_relaxed);
     if (record_idx >= DataChunk::kRecordCapacity) {
+        chunk->write_idx.fetch_sub(1, std::memory_order_relaxed);  // Rollback
         tls_data->AddNewChunk();
         return nullptr;
     }
     uint32_t buffer_offset = chunk->buffer_pos.fetch_add(required_size, std::memory_order_relaxed);
     if (buffer_offset + required_size > DataChunk::kBufferCapacity) {
+        chunk->buffer_pos.fetch_sub(required_size, std::memory_order_relaxed);  // Rollback
+        // Note: The record slot is now wasted, which is a small price for simplicity.
+        // A more complex system might try to reclaim it.
         tls_data->AddNewChunk();
         return nullptr;
     }
@@ -363,6 +367,82 @@ inline const StoredRecord* ColumnarRecordArena::AllocateAndAppend(std::string_vi
     size_.fetch_add(1, std::memory_order_release);
     return &record_slot;
 }
+
+inline std::vector<const StoredRecord*> ColumnarRecordArena::AllocateAndAppendBatch(
+    const std::vector<std::pair<std::string_view, std::string_view>>& batch, RecordType type) {
+    std::vector<const StoredRecord*> results;
+    if (batch.empty()) return results;
+    results.reserve(batch.size());
+
+    ThreadLocalData* tls_data = GetTlsData();
+    size_t current_item_idx = 0;
+
+    while (current_item_idx < batch.size()) {
+        DataChunk* chunk = tls_data->current_chunk;
+
+        // 1. Calculate how many items can fit in the current chunk
+        uint32_t record_start_idx = chunk->write_idx.load(std::memory_order_relaxed);
+        uint32_t buffer_start_pos = chunk->buffer_pos.load(std::memory_order_relaxed);
+
+        uint32_t records_to_alloc = 0;
+        size_t buffer_needed = 0;
+
+        for (size_t i = current_item_idx; i < batch.size(); ++i) {
+            const auto& [key, value] = batch[i];
+            size_t item_size = key.size() + value.size();
+            if (record_start_idx + records_to_alloc < DataChunk::kRecordCapacity &&
+                buffer_start_pos + buffer_needed + item_size <= DataChunk::kBufferCapacity) {
+                records_to_alloc++;
+                buffer_needed += item_size;
+            } else {
+                break;  // Chunk is full
+            }
+        }
+
+        if (records_to_alloc == 0) {
+            tls_data->AddNewChunk();
+            continue;  // Retry with the new chunk in the next loop iteration
+        }
+
+        // 2. Atomically reserve space for the sub-batch
+        uint32_t allocated_record_idx = chunk->write_idx.fetch_add(records_to_alloc, std::memory_order_relaxed);
+        uint32_t allocated_buffer_pos = chunk->buffer_pos.fetch_add(buffer_needed, std::memory_order_relaxed);
+
+        if (allocated_record_idx + records_to_alloc > DataChunk::kRecordCapacity ||
+            allocated_buffer_pos + buffer_needed > DataChunk::kBufferCapacity) {
+            // Race condition: another thread allocated space in between. We lost.
+            // Roll back our reservation.
+            chunk->write_idx.fetch_sub(records_to_alloc, std::memory_order_relaxed);
+            chunk->buffer_pos.fetch_sub(buffer_needed, std::memory_order_relaxed);
+            tls_data->AddNewChunk();
+            continue;  // Retry with the new chunk
+        }
+
+        // 3. Allocation successful, copy data and prepare records
+        size_t current_buffer_offset = 0;
+        for (uint32_t i = 0; i < records_to_alloc; ++i) {
+            const auto& [key, value] = batch[current_item_idx + i];
+
+            char* key_mem = chunk->buffer + allocated_buffer_pos + current_buffer_offset;
+            memcpy(key_mem, key.data(), key.size());
+            char* val_mem = key_mem + key.size();
+            memcpy(val_mem, value.data(), value.size());
+
+            StoredRecord& record_slot = chunk->records[allocated_record_idx + i];
+            record_slot.record = {{key_mem, key.size()}, {val_mem, value.size()}, type};
+            record_slot.ready.store(true, std::memory_order_release);
+
+            results.push_back(&record_slot);
+            current_buffer_offset += (key.size() + value.size());
+        }
+
+        size_.fetch_add(records_to_alloc, std::memory_order_release);
+        current_item_idx += records_to_alloc;
+    }
+
+    return results;
+}
+
 inline ConcurrentStringHashMap::ConcurrentStringHashMap(size_t build_size) {
     size_t capacity = calculate_power_of_2(build_size * 1.5 + 64);
     capacity_ = capacity;
@@ -394,10 +474,13 @@ inline void ConcurrentStringHashMap::Insert(std::string_view key, const StoredRe
                 slots_[pos].tag.store(tag, std::memory_order_release);
                 return;
             }
-            continue;
+            continue;  // Lost the race, retry this slot
         }
         pos = (pos + 1) & capacity_mask_;
-        if (pos == initial_pos) return;
+        if (pos == initial_pos) {
+            // --- for potential infinite loop ---
+            throw std::runtime_error("ConcurrentStringHashMap is full. Consider increasing capacity.");
+        }
     }
 }
 inline const StoredRecord* ConcurrentStringHashMap::Find(std::string_view key) const {
@@ -427,6 +510,7 @@ class FlashActiveBlock {
     explicit FlashActiveBlock(size_t cap) : index_(cap) {}
     ~FlashActiveBlock() {}
     bool TryAdd(std::string_view key, std::string_view value, RecordType type);
+    bool TryAddBatch(const std::vector<std::pair<std::string_view, std::string_view>>& batch, RecordType type);
     std::optional<RecordRef> Get(std::string_view key) const;
     size_t size() const { return data_log_.size(); }
     void Seal() { sealed_.store(true, std::memory_order_release); }
@@ -439,17 +523,34 @@ class FlashActiveBlock {
 };
 inline bool FlashActiveBlock::TryAdd(std::string_view key, std::string_view value, RecordType type) {
     if (is_sealed()) return false;
-    const StoredRecord* record_ptr;
-    while (true) {
-        record_ptr = data_log_.AllocateAndAppend(key, value, type);
-        if (record_ptr) break;
-        if (is_sealed()) return false;
-    }
+    const StoredRecord* record_ptr = data_log_.AllocateAndAppend(key, value, type);
     if (record_ptr) {
         index_.Insert(record_ptr->record.key, record_ptr);
+        return true;
     }
-    return record_ptr != nullptr;
+    // Allocation failed, likely because the chunk is full and a new one was allocated.
+    // The caller should retry.
+    return false;
 }
+
+inline bool FlashActiveBlock::TryAddBatch(const std::vector<std::pair<std::string_view, std::string_view>>& batch,
+                                          RecordType type) {
+    if (is_sealed()) return false;
+
+    auto record_ptrs = data_log_.AllocateAndAppendBatch(batch, type);
+
+    // After allocation, check again if we were sealed in the meantime.
+    // This isn't perfectly race-proof but a good practical check.
+    if (is_sealed()) return false;
+
+    for (const auto* record_ptr : record_ptrs) {
+        if (record_ptr) {
+            index_.Insert(record_ptr->record.key, record_ptr);
+        }
+    }
+    return true;
+}
+
 inline std::optional<RecordRef> FlashActiveBlock::Get(std::string_view key) const {
     const StoredRecord* record_ptr = index_.Find(key);
     return record_ptr ? std::optional<RecordRef>(record_ptr->record) : std::nullopt;
@@ -855,7 +956,6 @@ class ColumnarMemTable : public std::enable_shared_from_this<ColumnarMemTable> {
     std::unique_ptr<CompactingIterator> NewCompactingIterator();
 
    private:
-    // --- Core Shard Structures ---
     struct ImmutableState {
         using SortedBlockList = std::vector<std::shared_ptr<const SortedColumnarBlock>>;
         using SealedBlockList = std::vector<std::shared_ptr<FlashActiveBlock>>;
@@ -883,10 +983,9 @@ class ColumnarMemTable : public std::enable_shared_from_this<ColumnarMemTable> {
     struct BackgroundWorkItem {
         std::shared_ptr<FlashActiveBlock> block;
         std::unique_ptr<std::promise<void>> promise;
-        size_t shard_idx;  // Identify the source shard
+        size_t shard_idx;
     };
 
-    // --- Member Variables ---
     const size_t active_block_threshold_;
     const bool enable_compaction_;
     std::shared_ptr<Sorter> sorter_;
@@ -895,7 +994,6 @@ class ColumnarMemTable : public std::enable_shared_from_this<ColumnarMemTable> {
     std::vector<std::unique_ptr<Shard>> shards_;
     XXHasher hasher_;
 
-    // Shared background processing components
     std::vector<std::unique_ptr<ColumnarBlock>> columnar_block_pool_;
     std::mutex pool_mutex_;
     std::vector<BackgroundWorkItem> sealed_blocks_queue_;
@@ -904,7 +1002,6 @@ class ColumnarMemTable : public std::enable_shared_from_this<ColumnarMemTable> {
     std::thread background_thread_;
     std::atomic<bool> stop_background_thread_{false};
 
-    // --- Methods ---
     size_t GetShardIdx(std::string_view key) const { return hasher_(key) & shard_mask_; }
     void Insert(std::string_view key, std::string_view value, RecordType type);
     void SealActiveBlockIfNeeded(size_t shard_idx);
@@ -912,7 +1009,6 @@ class ColumnarMemTable : public std::enable_shared_from_this<ColumnarMemTable> {
     void ProcessBlocksForShard(size_t shard_idx, const std::vector<std::shared_ptr<FlashActiveBlock>>& sealed_blocks);
     std::shared_ptr<ColumnarBlock> GetPooledColumnarBlock();
 
-    // TLS Caching for performance
     std::shared_ptr<FlashActiveBlock> GetActiveBlockForThread(size_t shard_idx, bool force_refresh = false) const;
     std::shared_ptr<const ImmutableState> GetImmutableStateForThread(size_t shard_idx,
                                                                      bool force_refresh = false) const;
@@ -922,9 +1018,12 @@ class ColumnarMemTable : public std::enable_shared_from_this<ColumnarMemTable> {
 
 inline void ColumnarMemTable::Insert(std::string_view k, std::string_view v, RecordType t) {
     const size_t shard_idx = GetShardIdx(k);
-
     auto current_block = GetActiveBlockForThread(shard_idx);
+
+    // Retry loop handles cases where a block is full and a new one is allocated by this thread's arena
     while (!current_block->TryAdd(k, v, t)) {
+        // If TryAdd fails, it could be because the block was sealed by another thread,
+        // or this thread's arena just switched to a new chunk. Refreshing the block pointer handles both.
         current_block = GetActiveBlockForThread(shard_idx, true);
     }
 
@@ -961,15 +1060,135 @@ inline ColumnarMemTable::GetResult ColumnarMemTable::Get(std::string_view key) c
 }
 
 inline void ColumnarMemTable::PutBatch(const std::vector<std::pair<std::string_view, std::string_view>>& batch) {
-    for (const auto& [k, v] : batch) Insert(k, v, RecordType::Put);
+    if (batch.empty()) return;
+
+    std::vector<std::vector<std::pair<std::string_view, std::string_view>>> sharded_batches(num_shards_);
+    for (const auto& [key, value] : batch) {
+        sharded_batches[GetShardIdx(key)].emplace_back(key, value);
+    }
+
+    std::vector<std::future<void>> futures;
+    futures.reserve(num_shards_);
+
+    for (size_t shard_idx = 0; shard_idx < num_shards_; ++shard_idx) {
+        if (sharded_batches[shard_idx].empty()) continue;
+
+        futures.emplace_back(std::async(std::launch::async, [this, shard_idx, &sub_batch = sharded_batches[shard_idx]] {
+            auto current_block = GetActiveBlockForThread(shard_idx);
+
+            // The retry logic is simplified. TryAddBatch is efficient but might fail if the block is sealed.
+            // If it fails, we fall back to item-by-item insertion which is more robust to races.
+            if (!current_block->TryAddBatch(sub_batch, RecordType::Put)) {
+                current_block = GetActiveBlockForThread(shard_idx, true);  // Refresh block pointer
+                for (const auto& [key, value] : sub_batch) {
+                    while (!current_block->TryAdd(key, value, RecordType::Put)) {
+                        current_block = GetActiveBlockForThread(shard_idx, true);
+                    }
+                }
+            }
+
+            if (current_block->size() >= active_block_threshold_) {
+                SealActiveBlockIfNeeded(shard_idx);
+            }
+        }));
+    }
+
+    for (auto& f : futures) {
+        f.get();
+    }
 }
 
 inline ColumnarMemTable::MultiGetResult ColumnarMemTable::MultiGet(const std::vector<std::string_view>& keys) const {
-    MultiGetResult results;
+    if (keys.empty()) return {};
+
+    std::vector<std::vector<std::string_view>> sharded_keys(num_shards_);
+    std::vector<size_t> active_shards;
+    active_shards.reserve(num_shards_);
     for (const auto& key : keys) {
-        results.emplace(key, Get(key));
+        size_t shard_idx = GetShardIdx(key);
+        if (sharded_keys[shard_idx].empty()) {
+            active_shards.push_back(shard_idx);
+        }
+        sharded_keys[shard_idx].push_back(key);
     }
-    return results;
+
+    auto process_shards = [this](const std::vector<size_t>& shards_to_process,
+                                 const std::vector<std::vector<std::string_view>>& all_sharded_keys) -> MultiGetResult {
+        MultiGetResult local_results;
+
+        for (const size_t shard_idx : shards_to_process) {
+            auto active_block = GetActiveBlockForThread(shard_idx);
+            auto s = GetImmutableStateForThread(shard_idx);
+
+            for (const auto& key : all_sharded_keys[shard_idx]) {
+                // Stage 1: Active Block
+                if (auto r = active_block->Get(key)) {
+                    local_results[key] = (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt;
+                    continue;
+                }
+
+                if (s->sealed_blocks) {
+                    bool found = false;
+                    for (auto it = s->sealed_blocks->rbegin(); it != s->sealed_blocks->rend(); ++it) {
+                        if (auto r = (*it)->Get(key)) {
+                            local_results[key] = (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) continue;
+                }
+
+                if (s->blocks) {
+                    bool found = false;
+                    for (auto it = s->blocks->rbegin(); it != s->blocks->rend(); ++it) {
+                        if (auto r = (*it)->Get(key)) {
+                            local_results[key] = (r->type == RecordType::Put) ? GetResult(r->value) : std::nullopt;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) continue;
+                }
+            }
+        }
+        return local_results;
+    };
+
+    unsigned int num_workers = std::thread::hardware_concurrency();
+    if (active_shards.size() < 2 || num_workers < 2) {
+        MultiGetResult final_results = process_shards(active_shards, sharded_keys);
+        for (const auto& key : keys) {
+            final_results.try_emplace(key, std::nullopt);
+        }
+        return final_results;
+
+    } else {
+        if (num_workers > active_shards.size()) {
+            num_workers = active_shards.size();
+        }
+        std::vector<std::vector<size_t>> workloads(num_workers);
+        for (size_t i = 0; i < active_shards.size(); ++i) {
+            workloads[i % num_workers].push_back(active_shards[i]);
+        }
+
+        std::vector<std::future<MultiGetResult>> futures;
+        futures.reserve(num_workers);
+        for (const auto& workload : workloads) {
+            if (workload.empty()) continue;
+            futures.emplace_back(
+                std::async(std::launch::async, process_shards, std::cref(workload), std::cref(sharded_keys)));
+        }
+
+        MultiGetResult final_results;
+        for (auto& f : futures) {
+            final_results.merge(f.get());
+        }
+        for (const auto& key : keys) {
+            final_results.try_emplace(key, std::nullopt);
+        }
+        return final_results;
+    }
 }
 
 inline void ColumnarMemTable::SealActiveBlockIfNeeded(size_t shard_idx) {
@@ -1049,7 +1268,7 @@ inline std::unique_ptr<CompactingIterator> ColumnarMemTable::NewCompactingIterat
     WaitForBackgroundWork();
 
     std::vector<std::shared_ptr<const SortedColumnarBlock>> all_blocks;
-    for(const auto& shard_ptr : shards_) {
+    for (const auto& shard_ptr : shards_) {
         auto s = std::atomic_load(&shard_ptr->immutable_state_);
         if (s->blocks && !s->blocks->empty()) {
             all_blocks.insert(all_blocks.end(), s->blocks->begin(), s->blocks->end());
