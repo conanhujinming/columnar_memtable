@@ -643,10 +643,15 @@ inline SortedColumnarBlock::SortedColumnarBlock(std::shared_ptr<ColumnarBlock> b
     }
     min_key_ = block_data_->keys[sorted_indices_.front()];
     max_key_ = block_data_->keys[sorted_indices_.back()];
-    bloom_filter_ = std::make_unique<BloomFilter>(block_data_->size());
-    for (size_t i = 0; i < block_data_->size(); ++i) {
-        bloom_filter_->Add(block_data_->keys[i]);
+
+    constexpr size_t kBloomFilterThreshold = 256 * 1024; 
+    if (block_data_->size() < kBloomFilterThreshold) {
+        bloom_filter_ = std::make_unique<BloomFilter>(block_data_->size());
+        for (size_t i = 0; i < block_data_->size(); ++i) {
+            bloom_filter_->Add(block_data_->keys[i]);
+        }
     }
+
     sparse_index_.reserve(sorted_indices_.size() / kSparseIndexSampleRate + 1);
     for (size_t i = 0; i < sorted_indices_.size(); i += kSparseIndexSampleRate)
         sparse_index_.emplace_back(block_data_->keys[sorted_indices_[i]], i);
@@ -654,6 +659,9 @@ inline SortedColumnarBlock::SortedColumnarBlock(std::shared_ptr<ColumnarBlock> b
 
 inline bool SortedColumnarBlock::MayContain(std::string_view key) const {
     if (empty() || key < min_key_ || key > max_key_) return false;
+    if (!bloom_filter_) {
+        return true; 
+    }
     return bloom_filter_->MayContain(key);
 }
 
