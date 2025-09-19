@@ -58,7 +58,7 @@ std::shared_ptr<T> create_memtable(size_t size, bool compaction) {
     if constexpr (std::is_same_v<T, SkipListMemTable>) {
         return std::shared_ptr<T>(new T(size, compaction));
     } else {
-        return std::make_shared<T>(size, compaction);
+        return T::Create(size, compaction);
     }
 }
 template <typename MemTableType>
@@ -159,7 +159,7 @@ class BenchmarkRunner {
         if constexpr (std::is_same_v<MemTableType, SkipListMemTable>) {
             memtable = std::shared_ptr<MemTableType>(new MemTableType(memtable_size, compaction));
         } else {
-            memtable = std::make_shared<MemTableType>(memtable_size, compaction);
+            memtable = MemTableType::Create(memtable_size, compaction);
         }
     }
     void TearDown() {
