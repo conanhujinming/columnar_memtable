@@ -114,7 +114,7 @@ Using `ColumnarMemTable` is straightforward.
 int main() {
     // Create an instance of ColumnarMemTable
     // Args: active block size, enable compaction, sorter, number of shards
-    auto memtable = std::make_shared<ColumnarMemTable>(
+    auto memtable = ColumnarMemTable::Create(
         16 * 1024 * 1024, // 16MB per active block
         true,             // Enable compaction
         std::make_shared<ParallelRadixSorter>(),
