@@ -2,19 +2,22 @@
 #define SKIPLIST_MEMTABLE_H
 
 #include <random>
-#include <mutex> // Needed for thread-safe arena
+#include <mutex>
 
 #include "columnar_memtable.h"  // Includes FlushIterator and CompactingIterator definitions
 
 #include <atomic>
 #include <vector>
 #include <memory>
-#include <algorithm> // for std::max
+#include <algorithm>
 
 // A thread-safe, lock-free arena for concurrent allocations.
 class ConcurrentArena {
 public:
-    ConcurrentArena() : current_block_(AllocateNewBlock(4096)) {}
+    static constexpr size_t kDefaultBlockSize = 64 * 1024;
+
+    ConcurrentArena()
+        : current_block_(new Block(kDefaultBlockSize)), allocated_bytes_(kDefaultBlockSize) {}
 
     ~ConcurrentArena() {
         // The linked-list of blocks will be cleaned up automatically by unique_ptr.
@@ -52,8 +55,9 @@ public:
                 // as the wasted space is at the end of a full block.
                 // current->pos.fetch_sub(bytes, std::memory_order_relaxed);
 
-                size_t new_block_size = std::max(bytes, static_cast<size_t>(4096));
-                Block* new_block = AllocateNewBlock(new_block_size);
+                size_t new_block_size = std::max(bytes, kDefaultBlockSize);
+                Block* new_block = new Block(new_block_size);
+                new_block->next.store(current, std::memory_order_relaxed);
                 
                 // Try to swap the current block with our new one.
                 // If another thread already swapped it, `current` will be stale,
@@ -62,9 +66,7 @@ public:
                 if (current_block_.compare_exchange_strong(current, new_block, 
                                                            std::memory_order_release,
                                                            std::memory_order_acquire)) {
-                    // We successfully installed the new block.
-                    // Link the old block to the new one for eventual cleanup.
-                    new_block->next.store(current, std::memory_order_relaxed);
+                    allocated_bytes_.fetch_add(new_block_size, std::memory_order_relaxed);
                 } else {
                     // Another thread won the race. Delete the block we allocated but didn't use.
                     delete new_block;
@@ -80,6 +82,8 @@ public:
         return {mem, data.size()};
     }
 
+    size_t ApproximateMemoryUsage() const { return allocated_bytes_.load(std::memory_order_relaxed); }
+
 private:
     struct Block {
         std::unique_ptr<char[]> data;
@@ -91,14 +95,10 @@ private:
         explicit Block(size_t s) : data(new char[s]), size(s), pos(0), next(nullptr) {}
     };
 
-    // Helper to create a new block.
-    static Block* AllocateNewBlock(size_t s) {
-        return new Block(s);
-    }
-    
     // The head of the block list, where allocations happen.
     // This is the main point of contention, handled by atomics.
     std::atomic<Block*> current_block_;
+    std::atomic<size_t> allocated_bytes_;
 };
 
 namespace SkipListImpl {
@@ -109,17 +109,24 @@ class ConcurrentSkipList {
 
     struct Node {
         RecordRef record;
+        uint64_t key_prefix;
         // The forward array must be flexible. This is a common C-style trick.
         std::atomic<Node*> forward[1];
 
         // Factory function to correctly allocate a node of a specific height.
         static Node* New(ConcurrentArena& arena, std::string_view key, std::string_view value, RecordType type,
                          int height) {
-            // Calculate size needed for the node header and the flexible array member.
-            size_t size = sizeof(Node) + sizeof(std::atomic<Node*>) * (height - 1);
-            char* mem = arena.AllocateRaw(size);
-            Node* node = new (mem) Node(); // Placement new
-            node->record = {arena.AllocateAndCopy(key), arena.AllocateAndCopy(value), type};
+            const size_t node_size = sizeof(Node) + sizeof(std::atomic<Node*>) * (height - 1);
+            const size_t aligned_node_size =
+                (node_size + alignof(std::max_align_t) - 1) & ~(alignof(std::max_align_t) - 1);
+            char* mem = arena.AllocateRaw(aligned_node_size + key.size() + value.size());
+            Node* node = new (mem) Node();
+            char* key_mem = mem + aligned_node_size;
+            if (!key.empty()) memcpy(key_mem, key.data(), key.size());
+            char* value_mem = key_mem + key.size();
+            if (!value.empty()) memcpy(value_mem, value.data(), value.size());
+            node->record = {{key_mem, key.size()}, {value_mem, value.size()}, type};
+            node->key_prefix = load_u64_prefix(key);
             // Initialize forward pointers to null.
             for (int i = 0; i < height; ++i) {
                 node->forward[i].store(nullptr, std::memory_order_relaxed);
@@ -137,13 +144,23 @@ class ConcurrentSkipList {
     void Insert(std::string_view key, std::string_view value, RecordType type);
     std::optional<RecordRef> Find(std::string_view key) const;
     Iterator begin() const;
+    size_t ApproximateMemoryUsage() const { return arena_.ApproximateMemoryUsage(); }
+    size_t size() const { return size_.load(std::memory_order_relaxed); }
 
    private:
     int RandomHeight();
+    void FindInsertionSplice(std::string_view key, uint64_t key_prefix, Node** predecessors, Node** successors) const;
+    static bool KeyIsBefore(const Node* node, uint64_t prefix, std::string_view key) {
+        return node->key_prefix < prefix || (node->key_prefix == prefix && node->record.key < key);
+    }
+    static bool KeyIsBeforeOrEqual(const Node* node, uint64_t prefix, std::string_view key) {
+        return node->key_prefix < prefix || (node->key_prefix == prefix && node->record.key <= key);
+    }
 
     ConcurrentArena arena_;
     Node* const head_;
     std::atomic<int> max_height_;
+    std::atomic<size_t> size_{0};
 };
 
 class ConcurrentSkipList::Iterator {
@@ -164,103 +181,96 @@ inline ConcurrentSkipList::Iterator ConcurrentSkipList::begin() const {
 }
 
 inline int ConcurrentSkipList::RandomHeight() {
-    static thread_local std::mt19937 generator(std::random_device{}());
-    std::uniform_int_distribution<int> distribution(0, 1);
+    static thread_local uint64_t random_state = [] {
+        std::random_device device;
+        uint64_t seed = (static_cast<uint64_t>(device()) << 32) ^ device();
+        return seed == 0 ? 0x9e3779b97f4a7c15ULL : seed;
+    }();
+    auto next_random = [&] {
+        random_state ^= random_state >> 12;
+        random_state ^= random_state << 25;
+        random_state ^= random_state >> 27;
+        return random_state * 0x2545f4914f6cdd1dULL;
+    };
+
+    // A branching factor of four is a better match for a 12-level list than
+    // the old 1/2 probability, which left hundreds of nodes on the top level
+    // at 500k entries.
     int height = 1;
-    while (height < kMaxHeight && distribution(generator) == 1) {
-        height++;
-    }
+    while (height < kMaxHeight && (next_random() & 3U) == 0) ++height;
     return height;
 }
 
-// =================================================================================================
-// A robust and correct lock-free Insert implementation.
-// =================================================================================================
+inline void ConcurrentSkipList::FindInsertionSplice(std::string_view key, uint64_t key_prefix, Node** predecessors,
+                                                     Node** successors) const {
+    Node* current = head_;
+    const int current_height = max_height_.load(std::memory_order_acquire);
+    for (int level = current_height - 1; level >= 0; --level) {
+        Node* next = current->forward[level].load(std::memory_order_acquire);
+        while (next != nullptr && KeyIsBeforeOrEqual(next, key_prefix, key)) {
+            current = next;
+            next = current->forward[level].load(std::memory_order_acquire);
+        }
+        predecessors[level] = current;
+        successors[level] = next;
+    }
+    for (int level = current_height; level < kMaxHeight; ++level) {
+        predecessors[level] = head_;
+        successors[level] = head_->forward[level].load(std::memory_order_acquire);
+    }
+}
+
 inline void ConcurrentSkipList::Insert(std::string_view key, std::string_view value, RecordType type) {
-    Node* update[kMaxHeight];
-    Node* x;
+    const int height = RandomHeight();
+    Node* new_node = Node::New(arena_, key, value, type, height);
+    const uint64_t key_prefix = new_node->key_prefix;
+    Node* predecessors[kMaxHeight];
+    Node* successors[kMaxHeight];
 
-    // The outer retry loop handles all conflicts. If any CAS fails, we restart.
+    // Linearize the insertion exactly once at level zero.  The old code
+    // allocated and inserted a second logical record whenever an upper-level
+    // CAS failed.
     while (true) {
-        x = head_;
-        // 1. Find predecessors for all levels based on a consistent snapshot.
-        for (int i = kMaxHeight - 1; i >= 0; --i) {
-            Node* next = x->forward[i].load(std::memory_order_acquire);
-            while (next != nullptr && next->record.key < key) {
-                x = next;
-                next = x->forward[i].load(std::memory_order_acquire);
+        FindInsertionSplice(key, key_prefix, predecessors, successors);
+        for (int level = 0; level < height; ++level) {
+            new_node->forward[level].store(successors[level], std::memory_order_relaxed);
+        }
+        Node* expected = successors[0];
+        if (predecessors[0]->forward[0].compare_exchange_weak(expected, new_node, std::memory_order_release,
+                                                              std::memory_order_acquire)) {
+            break;
+        }
+    }
+    size_.fetch_add(1, std::memory_order_relaxed);
+
+    int observed_height = max_height_.load(std::memory_order_relaxed);
+    while (observed_height < height &&
+           !max_height_.compare_exchange_weak(observed_height, height, std::memory_order_release,
+                                              std::memory_order_relaxed)) {
+    }
+
+    // No nodes are removed, so the node is safe to publish one upper level at
+    // a time.  A failed CAS only requires recomputing that level's splice.
+    for (int level = 1; level < height; ++level) {
+        while (true) {
+            new_node->forward[level].store(successors[level], std::memory_order_relaxed);
+            Node* expected = successors[level];
+            if (predecessors[level]->forward[level].compare_exchange_weak(
+                    expected, new_node, std::memory_order_release, std::memory_order_acquire)) {
+                break;
             }
-            update[i] = x;
+            FindInsertionSplice(key, key_prefix, predecessors, successors);
         }
-        
-        // Find the precise predecessor at level 0, handling duplicate keys.
-        Node* pred_at_level_0 = update[0];
-        Node* successor = pred_at_level_0->forward[0].load(std::memory_order_acquire);
-        while (successor != nullptr && successor->record.key == key) {
-             pred_at_level_0 = successor;
-             successor = successor->forward[0].load(std::memory_order_acquire);
-        }
-
-        // 2. Determine the height of the new node.
-        int height = RandomHeight();
-        if (height > max_height_.load(std::memory_order_relaxed)) {
-            max_height_.store(height, std::memory_order_relaxed);
-        }
-
-        // 3. Allocate the new node.
-        Node* new_node = Node::New(arena_, key, value, type, height);
-        
-        // Link the new node's successor at level 0.
-        new_node->forward[0].store(successor, std::memory_order_relaxed);
-        
-        // 4. The crucial atomic step: try to link the new node at level 0.
-        // If this fails, another thread interfered. We must restart the entire process.
-        if (!pred_at_level_0->forward[0].compare_exchange_strong(successor, new_node, std::memory_order_release,
-                                                                 std::memory_order_relaxed)) {
-            // Conflict detected at the most critical point. Restart the whole operation.
-            continue; // The allocated new_node is leaked in the arena, which is acceptable.
-        }
-
-        // 5. Success at level 0. Now link the upper levels.
-        // This is a "best effort" attempt. If it fails, the node is still reachable
-        // via lower levels, so correctness is maintained. We still retry the whole
-        // insert to ensure the skiplist structure is optimal for performance.
-        for (int i = 1; i < height; ++i) {
-            Node* pred = update[i];
-            Node* succ = pred->forward[i].load(std::memory_order_acquire);
-
-            // Set the new node's forward pointer for this level.
-            new_node->forward[i].store(succ, std::memory_order_relaxed);
-
-            // Attempt to swing the predecessor's pointer.
-            // If this fails, our `update` array is stale. The simplest and most robust
-            // solution is to abort this attempt and let the outer loop retry everything.
-            if (!pred->forward[i].compare_exchange_strong(succ, new_node, std::memory_order_release,
-                                                          std::memory_order_relaxed)) {
-                // Another thread changed the list at this level. Our `update` array is invalid.
-                // Instead of trying to patch it (which is buggy), we signal the need for a full retry.
-                // We break out of this inner loop and will then restart the outer while(true) loop.
-                // A simple way to do this is to use a flag or a goto.
-                goto retry; 
-            }
-        }
-
-        // If we successfully linked all levels without conflicts, we are done.
-        return;
-
-    retry:
-        // This label is the target for when an upper-level CAS fails.
-        // The outer while(true) loop will then continue.
-        ;
     }
 }
 
 inline std::optional<RecordRef> ConcurrentSkipList::Find(std::string_view key) const {
     Node* x = head_;
+    const uint64_t key_prefix = load_u64_prefix(key);
     // Standard search from top-left.
-    for (int i = kMaxHeight - 1; i >= 0; --i) {
+    for (int i = max_height_.load(std::memory_order_acquire) - 1; i >= 0; --i) {
         Node* next = x->forward[i].load(std::memory_order_acquire);
-        while (next != nullptr && next->record.key < key) {
+        while (next != nullptr && KeyIsBefore(next, key_prefix, key)) {
             x = next;
             next = x->forward[i].load(std::memory_order_acquire);
         }
@@ -294,16 +304,20 @@ class SkipListFlushIterator {
 class SkipListMemTable {
    public:
     using GetResult = std::optional<std::string_view>;
-    using MultiGetResult = std::map<std::string_view, GetResult, std::less<>>;
+    using MultiGetResult = std::vector<GetResult>;
 
-    explicit SkipListMemTable(size_t, bool, std::shared_ptr<Sorter> = nullptr)
-        : skiplist_(std::make_shared<SkipListImpl::ConcurrentSkipList>()) {}
+    explicit SkipListMemTable(size_t, bool, std::shared_ptr<Sorter> = nullptr, size_t batch_worker_count = 1)
+        : skiplist_(std::make_shared<SkipListImpl::ConcurrentSkipList>()),
+          batch_worker_count_(std::max<size_t>(1, batch_worker_count)),
+          batch_pool_(batch_worker_count_ > 1 ? std::make_shared<ThreadPool>(batch_worker_count_) : nullptr) {}
 
     ~SkipListMemTable() = default;
     SkipListMemTable(const SkipListMemTable&) = delete;
     SkipListMemTable& operator=(const SkipListMemTable&) = delete;
 
     void WaitForBackgroundWork() {}
+    void WaitForPendingBackgroundWork() {}
+    void WaitForBackgroundBacklogAtMost(size_t) {}
 
     std::unique_ptr<CompactingIterator> NewCompactingIterator() {
         auto raw_iter = std::make_unique<SkipListImpl::SkipListFlushIterator>(skiplist_);
@@ -323,26 +337,70 @@ class SkipListMemTable {
     }
 
     void PutBatch(const std::vector<std::pair<std::string_view, std::string_view>>& batch) {
-        for (const auto& [key, value] : batch) {
-            Put(key, value);
+        if (!batch_pool_ || batch.size() < 2) {
+            for (const auto& [key, value] : batch) Put(key, value);
+            return;
+        }
+
+        const size_t task_count = std::min(batch_worker_count_, batch.size());
+        const size_t items_per_task = (batch.size() + task_count - 1) / task_count;
+        std::vector<std::future<void>> futures;
+        futures.reserve(task_count);
+        for (size_t task_idx = 0; task_idx < task_count; ++task_idx) {
+            const size_t begin = task_idx * items_per_task;
+            const size_t end = std::min(batch.size(), begin + items_per_task);
+            if (begin == end) break;
+            futures.emplace_back(batch_pool_->Submit([this, &batch, begin, end] {
+                for (size_t i = begin; i < end; ++i) Put(batch[i].first, batch[i].second);
+            }));
+        }
+        for (auto& future : futures) {
+            future.get();
         }
     }
 
     MultiGetResult MultiGet(const std::vector<std::string_view>& keys) const {
-        MultiGetResult results;
-        for (const auto& key : keys) {
-            // Small optimization to avoid re-lookups for duplicate keys in the input vector
-            if (results.find(key) == results.end()) { 
-                results.emplace(key, Get(key));
+        MultiGetResult results(keys.size());
+        auto get_range = [this, &keys, &results](size_t begin, size_t end) {
+            for (size_t i = begin; i < end; ++i) {
+                results[i] = Get(keys[i]);
             }
+        };
+
+        if (!batch_pool_ || keys.size() < 2) {
+            get_range(0, keys.size());
+            return results;
+        }
+
+        const size_t task_count = std::min(batch_worker_count_, keys.size());
+        const size_t items_per_task = (keys.size() + task_count - 1) / task_count;
+        std::vector<std::future<void>> futures;
+        futures.reserve(task_count);
+        for (size_t task_idx = 0; task_idx < task_count; ++task_idx) {
+            const size_t begin = task_idx * items_per_task;
+            const size_t end = std::min(keys.size(), begin + items_per_task);
+            if (begin == end) break;
+            futures.emplace_back(batch_pool_->Submit([get_range, begin, end] { get_range(begin, end); }));
+        }
+
+        for (auto& future : futures) {
+            future.get();
         }
         return results;
     }
 
-    size_t GetSortedBlockNum() const { return 0; }
+    size_t GetSortedBlockNum() const { return skiplist_->size() == 0 ? 0 : 1; }
+    size_t GetSortedRecordCount() const { return skiplist_->size(); }
+    size_t GetActiveRecordCount() const { return 0; }
+    size_t GetPendingSealedBlockNum() const { return 0; }
+    size_t GetPendingSealedRecordCount() const { return 0; }
+    size_t ApproximateMemoryUsage() const { return skiplist_->ApproximateMemoryUsage(); }
+    size_t BatchWorkerCount() const { return batch_worker_count_; }
 
    private:
     std::shared_ptr<SkipListImpl::ConcurrentSkipList> skiplist_;
+    const size_t batch_worker_count_;
+    std::shared_ptr<ThreadPool> batch_pool_;
 };
 
 #endif  // SKIPLIST_MEMTABLE_H
